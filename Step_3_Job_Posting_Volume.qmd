@@ -1,0 +1,160 @@
+---
+title: "Job posting volume over time"
+format: html
+---
+
+# Step three of first project requriemnt (ELT Pipeline)
+3. Job posting volume over time 
+        - JobSpy (open source Python, scrapes Indeed/LinkedIn)
+
+# Goal
+ Measure how actively each startup is hiring right now, which is the first time varying signal that distinguishes growing companies from stagnant ones, and add that data to the data set
+
+TLDR
+1. Installed JobSpy (worked around Python 3.13 compatibility issues)
+2. Tested Indeed
+    -too generic returned wrong companies
+3. Switched to LinkedIn
+    -accurate matches
+4. Built exact-match filter to drop false positives (generic company names like "Anything" pulling unrelated results)
+5. Tested on 5 companies successfully
+    -got 8 clean matches
+6. Ran full scrapted 871 companies (45 min scrape, dont scroll the the bottom and hit run above!!)
+7. Droped Null columns
+8. Encoded job categrocial classifications 
+9. exported
+
+import data
+```{python}
+import pandas as pd
+
+df = pd.read_parquet(r"C:\Users\spink\OneDrive\Desktop\Personal Projects\Startup Momentum Prediction Pipeline\Data\companies_clean.parquet")
+
+print(f"Shape: {df.shape}")
+print(f"\nColumns:")
+for col in df.columns:
+    print(f"  {col}")
+```
+
+insatall packages need for scrapping
+```{python}
+pip install numpy
+```
+
+```{python}
+pip install python-jobspy --no-deps
+```
+
+```{python}
+pip install requests beautifulsoup4 tls_client regex
+```
+
+```{python}
+pip install markdownify pydantic
+```
+
+Test
+```{python}
+jobs = scrape_jobs(
+    site_name=["linkedin"],
+    search_term="Artie",
+    location="San Francisco, CA",
+    results_wanted=5,
+)
+print(jobs.shape)
+if len(jobs) > 0:
+    print(jobs[["title", "company", "location"]].to_string())
+```
+
+install jobspy, deifine companies to scrape 
+```{python}
+from jobspy import scrape_jobs
+import pandas as pd
+import time
+
+companies = pd.read_parquet(r"C:\Users\spink\OneDrive\Desktop\Personal Projects\Startup Momentum Prediction Pipeline\Data\companies_clean.parquet")
+```
+
+Scarpe
+# IMPORTANT: DONT RE RUN THIS! Takes forever for scrape_jobs to scrape the info for all 871 comapnies 
+```{python}
+all_jobs = []
+errors = []
+
+for i, row in companies.iterrows():
+    name = row["name"]
+    city = row["city"]
+    state = row["state"]
+    location = f"{city}, {state}" if pd.notna(city) and pd.notna(state) else "United States"
+    
+    try:
+        jobs = scrape_jobs(
+            site_name=["linkedin"],
+            search_term=name,
+            location=location,
+            results_wanted=25,
+        )
+        jobs["company_searched"] = name
+        all_jobs.append(jobs)
+        print(f"[{i+1}/{len(companies)}] {name}: {len(jobs)} postings")
+    except Exception as e:
+        errors.append({"name": name, "error": str(e)})
+        print(f"[{i+1}/{len(companies)}] {name}: ERROR - {e}")
+    
+    time.sleep(3)
+```
+
+Combine and filter to exact matches
+```{python}
+jobs_df = pd.concat(all_jobs, ignore_index=True) if all_jobs else pd.DataFrame()
+jobs_df["match"] = jobs_df.apply(
+    lambda r: str(r["company"]).strip().lower() == r["company_searched"].strip().lower(),
+    axis=1
+)
+matched = jobs_df[jobs_df["match"]].drop(columns=["match"])
+```
+
+drop nulls (context: rushed to export and found these columns where 100% null)
+```{python}
+keep_cols = ["id", "title", "company", "company_searched", "location",
+             "date_posted", "is_remote", "company_url"]
+matched = matched[keep_cols]
+matched["date_posted"] = pd.to_datetime(matched["date_posted"], errors="coerce")
+```
+
+Catogorize roles 
+```{python}
+def classify_role(title):
+    t = str(title).lower()
+    if any(w in t for w in ["engineer", "developer", "swe", "devops", "backend", "frontend", "fullstack", "sre", "infrastructure"]):
+        return "engineering"
+    elif any(w in t for w in ["sales", "account executive", "ae", "bdr", "sdr", "revenue", "business development"]):
+        return "sales"
+    elif any(w in t for w in ["marketing", "growth", "content", "brand", "communications", "pr"]):
+        return "marketing"
+    elif any(w in t for w in ["product manager", "product design", "designer", "ux", "ui"]):
+        return "product"
+    elif any(w in t for w in ["operations", "ops", "chief of staff", "office manager", "people", "hr", "recruiting"]):
+        return "operations"
+    elif any(w in t for w in ["data", "analyst", "analytics", "machine learning", "ml", "ai"]):
+        return "data"
+    elif any(w in t for w in ["finance", "accounting", "controller", "cfo"]):
+        return "finance"
+    else:
+        return "other"
+
+matched["role_category"] = matched["title"].apply(classify_role)
+
+print(f"\nRole distribution:")
+print(matched["role_category"].value_counts())
+print(f"\nTop 10 by posting count:")
+print(matched.groupby("company_searched").size().sort_values(ascending=False).head(10))
+```
+
+Export
+-some data points have <empty> instead of null, mostly in th elovcation column, but its infrequent enough to ingnore 
+```{python}
+matched = matched.drop(columns=["job_level"])
+matched.to_parquet(r"C:\Users\spink\OneDrive\Desktop\Personal Projects\Startup Momentum Prediction Pipeline\Data\job_postings_raw.parquet", index=False)
+print(matched.columns.tolist())
+```
