@@ -1,0 +1,126 @@
+---
+title: "Data Gathering"
+format: html
+---
+
+
+
+# Step 1 of the first project requriemnt (ELT Pipeline)
+
+1. Company universe (name, location, founded date, stage, headcount) 
+    -Crunchbase Basic free API or CSV export
+    &
+    Funding rounds (date, amount, round type, investors) 
+    -Crunchbase + SEC EDGAR Form D filings
+
+# Goal 
+ build a clean table of which startups exist and their static attributes (funding, age, location, industry etc) to build out later.
+
+
+# 1: Company Universe & FundingRounds
+
+Get CrunchBase data 
+ Crunchbase promt: 
+        Founded Date → after → 01/01/2021
+        Last Funding Date → after → 07/01/2025
+        Total Funding Amount → between → $1,000,000 and $20,000,000
+        Number of Funding Rounds → between → 2 and 4
+        Operating Status → is → Active
+        Headquarters Location → United States
+Had to add most the columns manualy in CrunchBase before exporting. 
+
+```{python}
+import pandas as pd
+
+df = pd.read_csv(r"C:\Users\spink\OneDrive\Desktop\Personal Projects\Startup Momentum Prediction Pipeline\Data\cd_orgs_raw.csv")
+
+print(f"Shape: {df.shape}")
+print(f"\nColumns:")
+for col in df.columns:
+    print(f"  {col}")
+```
+
+```{python}
+print(df.dtypes)
+```
+
+```{python}
+print(f"Null counts:\n{df.isnull().sum()}")
+```
+
+Drop high nulll columns
+```{python}
+drop_cols = [
+    "Actively Hiring",
+    "Phone Number",
+    "Total Funding Amount",
+    "Total Funding Amount Currency",
+    "Last Funding Amount",
+    "Last Funding Amount Currency",
+    "Description",  
+]
+df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+```
+
+
+Rename for clean snake_case, ready for python columns
+```{python}
+df = df.rename(columns={
+    "Organization Name": "name",
+    "Organization Name URL": "cb_url",
+    "Industries": "industries",
+    "Headquarters Location": "hq_location",
+    "CB Rank (Company)": "cb_rank",
+    "Last Funding Date": "last_funding_date",
+    "Founded Date": "founded_date",
+    "Founded Date Precision": "founded_date_precision",
+    "Total Funding Amount (in USD)": "total_funding_usd",
+    "Number of Employees": "num_employees",
+    "Last Funding Type": "last_funding_type",
+    "Website": "website",
+    "LinkedIn": "linkedin",
+    "Last Funding Amount (in USD)": "last_funding_amount_usd",
+    "Top 5 Investors": "top_investors",
+    "Number of Investors": "num_investors",
+    "Contact Email": "contact_email",
+    "Full Description": "full_description",
+    "Number of Articles": "num_articles",
+})
+```
+
+Parse dates
+```{python}
+df["founded_date"] = pd.to_datetime(df["founded_date"], errors="coerce")
+df["last_funding_date"] = pd.to_datetime(df["last_funding_date"], errors="coerce")
+```
+
+Split HQ location into city, state, country
+```{python}
+location_split = df["hq_location"].str.rsplit(", ", n=2, expand=True)
+df["city"] = location_split[0]
+df["state"] = location_split[1] if 1 in location_split.columns else None
+df["country"] = location_split[2] if 2 in location_split.columns else None
+```
+
+Company age in days, Days since last funding, Funding per round,  Save cleaned version
+```{python}
+df["company_age_days"] = (pd.Timestamp.now() - df["founded_date"]).dt.days
+
+df["days_since_last_funding"] = (pd.Timestamp.now() - df["last_funding_date"]).dt.days
+
+df["funding_per_investor"] = df["total_funding_usd"] / df["num_investors"].fillna(1)
+```
+
+Save cleaned version 
+```{python}
+df.to_parquet(r"C:\Users\spink\OneDrive\Desktop\Personal Projects\Startup Momentum Prediction Pipeline\Data\companies_clean.parquet", index=False)
+```
+
+How we Lookin?
+```{python}
+print(f"Shape: {df.shape}")
+print(f"\nSample:")
+print(df[["name", "city", "state", "total_funding_usd", "company_age_days", "days_since_last_funding"]].head(10).to_string())
+print(f"\nNull counts:\n{df.isnull().sum()}")
+print(f"\nSaved to companies_clean.parquet")
+```
