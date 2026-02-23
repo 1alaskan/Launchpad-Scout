@@ -1,0 +1,330 @@
+---
+title: "03b — SEC EDGAR Form D Filings"
+format: html
+---
+
+## Overview
+
+Collect SEC EDGAR Form D filings for 871 early-stage companies in the spine.
+Form D filings are required when companies raise private capital (seed, Series A, etc.)
+and serve as ground-truth fundraising signals for the ML model's label.
+
+**Input:** `Data/companies_spine.parquet` (871 companies)
+**Output:** `Data/sec_edgar_filings.parquet`
+
+Install required packages
+```{python}
+#| eval: false
+%pip install thefuzz
+```
+
+Imports and configuration
+```{python}
+from pathlib import Path
+import pandas as pd
+import requests
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from thefuzz import fuzz
+
+PROJECT_ROOT = Path.cwd()
+if (PROJECT_ROOT / "Data" / "companies_spine.parquet").exists():
+    DATA_DIR = PROJECT_ROOT / "Data"
+elif (PROJECT_ROOT.parent / "Data" / "companies_spine.parquet").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+    DATA_DIR = PROJECT_ROOT / "Data"
+else:
+    raise FileNotFoundError("Cannot find Data/companies_spine.parquet")
+
+EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
+EDGAR_HEADERS = {
+    "User-Agent": "StartupPipeline/1.0 (spinkmt@gmail.com)",
+    "Accept": "application/json",
+}
+RATE_LIMIT_DELAY = 0.12  # ~8 req/sec, safely under the 10/sec limit
+FUZZY_THRESHOLD = 80
+TODAY = datetime.today().strftime("%Y-%m-%d")
+```
+
+Map full state names to two-letter abbreviations for EDGAR matching
+```{python}
+STATE_ABBREV = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+    "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+    "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY", "District of Columbia": "DC",
+}
+```
+
+Load the company spine
+```{python}
+spine = pd.read_parquet(DATA_DIR / "companies_spine.parquet")
+print(f"Loaded {len(spine)} companies")
+spine[["company_id", "name", "state", "founded_date"]].head()
+```
+
+## Helper Functions
+
+Query EDGAR EFTS for Form D / D/A filings matching a company name
+```{python}
+def search_edgar(company_name: str, start_date: str, end_date: str) -> list[dict]:
+    params = {
+        "q": f'"{company_name}"',
+        "forms": "D,D/A",
+        "dateRange": "custom",
+        "startdt": start_date,
+        "enddt": end_date,
+    }
+    resp = requests.get(
+        EDGAR_SEARCH_URL, params=params, headers=EDGAR_HEADERS, timeout=30
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = []
+    for hit in data.get("hits", {}).get("hits", []):
+        src = hit.get("_source", {})
+        display_names = src.get("display_names", [])
+        # display_names look like "Company Name  (CIK 0001234567)"
+        filer_name = display_names[0].split("  (CIK")[0].strip() if display_names else ""
+        ciks = src.get("ciks", [])
+        results.append({
+            "filer_name": filer_name,
+            "cik": ciks[0] if ciks else "",
+            "filing_date": src.get("file_date", ""),
+            "form_type": src.get("form", ""),
+            "biz_states": src.get("biz_states", []),
+            "inc_states": src.get("inc_states", []),
+            "accession": src.get("adsh", ""),
+            "doc_id": hit.get("_id", ""),
+        })
+    return results
+```
+
+Fetch the Form D XML for a single filing and extract offering amounts
+```{python}
+def fetch_offering_amounts(cik: str, accession: str, doc_id: str) -> dict:
+    clean_cik = cik.lstrip("0") or "0"
+    clean_accession = accession.replace("-", "")
+    filename = doc_id.split(":")[-1] if ":" in doc_id else "primary_doc.xml"
+    url = (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{clean_cik}/{clean_accession}/{filename}"
+    )
+    try:
+        resp = requests.get(url, headers=EDGAR_HEADERS, timeout=30)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+
+        offering_amount = None
+        amount_sold = None
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag == "totalOfferingAmount" and elem.text:
+                try:
+                    offering_amount = float(elem.text)
+                except ValueError:
+                    pass
+            elif tag == "totalAmountSold" and elem.text:
+                try:
+                    amount_sold = float(elem.text)
+                except ValueError:
+                    pass
+        return {"offering_amount": offering_amount, "amount_sold": amount_sold}
+    except Exception:
+        return {"offering_amount": None, "amount_sold": None}
+```
+
+Fuzzy-match a spine company against an EDGAR filer name, with state validation
+```{python}
+def match_company(
+    company_name: str,
+    company_state: str,
+    filer_name: str,
+    biz_states: list,
+    inc_states: list,
+) -> int | None:
+    """Return fuzzy match score if above threshold, else None."""
+    score = fuzz.token_sort_ratio(company_name.lower(), filer_name.lower())
+    if score < FUZZY_THRESHOLD:
+        return None
+
+    # State cross-check: most startups incorporate in DE but operate elsewhere,
+    # so only reject on state mismatch for borderline scores.
+    state_abbrev = STATE_ABBREV.get(company_state, "")
+    if state_abbrev:
+        all_states = set(biz_states + inc_states)
+        if all_states and state_abbrev not in all_states and score < 90:
+            return None
+
+    return score
+```
+
+## Phase 1 — Search EDGAR and Fuzzy-Match
+
+For each company, query EFTS and keep filings that pass fuzzy + state matching
+```{python}
+matched_filings = []
+errors = []
+
+for idx, row in spine.iterrows():
+    company_id = row["company_id"]
+    name = row["name"]
+    state = row["state"] if pd.notna(row["state"]) else ""
+    founded = row["founded_date"]
+    start_date = (
+        founded.strftime("%Y-%m-%d") if pd.notna(founded) else "2015-01-01"
+    )
+
+    try:
+        filings = search_edgar(name, start_date, TODAY)
+        for f in filings:
+            score = match_company(
+                name, state, f["filer_name"], f["biz_states"], f["inc_states"]
+            )
+            if score is not None:
+                matched_filings.append({
+                    "company_id": company_id,
+                    "name": name,
+                    "cik": f["cik"],
+                    "filing_date": f["filing_date"],
+                    "form_type": f["form_type"],
+                    "filer_name": f["filer_name"],
+                    "match_score": score,
+                    "accession": f["accession"],
+                    "doc_id": f["doc_id"],
+                })
+    except Exception as e:
+        errors.append({"company_id": company_id, "name": name, "error": str(e)})
+
+    i = idx + 1
+    if i % 50 == 0:
+        print(f"[{i}/{len(spine)}] searched — {len(matched_filings)} matched so far")
+
+    time.sleep(RATE_LIMIT_DELAY)
+
+print(f"\nPhase 1 done: {len(matched_filings)} matched filings, {len(errors)} errors")
+```
+
+## Phase 2 — Fetch Offering Amounts from Filing XML
+
+Only fetch XML for filings that passed fuzzy matching
+```{python}
+print(f"Fetching offering amounts for {len(matched_filings)} filings...")
+
+for i, rec in enumerate(matched_filings):
+    amounts = fetch_offering_amounts(rec["cik"], rec["accession"], rec["doc_id"])
+    rec["offering_amount"] = amounts["offering_amount"]
+    rec["amount_sold"] = amounts["amount_sold"]
+
+    if (i + 1) % 50 == 0:
+        print(f"[{i + 1}/{len(matched_filings)}] XML fetches done")
+
+    time.sleep(RATE_LIMIT_DELAY)
+
+print("Phase 2 done")
+```
+
+## Build and Save Output
+
+Assemble dataframe, drop work columns, deduplicate, and save
+```{python}
+if matched_filings:
+    df = pd.DataFrame(matched_filings)
+    df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
+    df = df.drop(columns=["accession", "doc_id"])
+    df = df.drop_duplicates(subset=["company_id", "filing_date", "form_type"])
+    df = df.sort_values(["company_id", "filing_date"]).reset_index(drop=True)
+else:
+    df = pd.DataFrame(columns=[
+        "company_id", "name", "cik", "filing_date", "form_type",
+        "offering_amount", "amount_sold", "filer_name", "match_score",
+    ])
+
+out_path = DATA_DIR / "sec_edgar_filings.parquet"
+df.to_parquet(out_path, index=False)
+print(f"Saved {len(df)} rows to {out_path}")
+df.head(10)
+```
+
+## Summary Statistics
+
+```{python}
+print(f"Total filings found: {len(df)}")
+print(f"Companies with >= 1 filing: {df['company_id'].nunique()}")
+
+if len(df) > 0:
+    print(f"Filing date range: {df['filing_date'].min()} — {df['filing_date'].max()}")
+    print(f"\nForm type distribution:")
+    print(df["form_type"].value_counts().to_string())
+    print(f"\nMatch score distribution:")
+    print(df["match_score"].describe().to_string())
+    non_null = df["offering_amount"].dropna()
+    if len(non_null) > 0:
+        print(f"\nOffering amount (non-null, n={len(non_null)}):")
+        print(f"  Median: ${non_null.median():,.0f}")
+        print(f"  Mean:   ${non_null.mean():,.0f}")
+
+if errors:
+    print(f"\n{len(errors)} companies had search errors:")
+    for e in errors[:10]:
+        print(f"  {e['name']}: {e['error']}")
+    if len(errors) > 10:
+        print(f"  ... and {len(errors) - 10} more")
+```
+
+## Unit Tests
+
+Precondition and postcondition tests
+```{python}
+# ---- Precondition tests ----
+assert "company_id" in spine.columns, "Spine missing company_id"
+assert "name" in spine.columns, "Spine missing name"
+assert "state" in spine.columns, "Spine missing state"
+assert "founded_date" in spine.columns, "Spine missing founded_date"
+assert len(spine) > 0, "Spine is empty"
+print("Precondition tests passed")
+
+# ---- Postcondition tests ----
+out = pd.read_parquet(DATA_DIR / "sec_edgar_filings.parquet")
+
+expected_cols = {
+    "company_id", "name", "cik", "filing_date", "form_type",
+    "offering_amount", "amount_sold", "filer_name", "match_score",
+}
+assert expected_cols.issubset(set(out.columns)), (
+    f"Missing columns: {expected_cols - set(out.columns)}"
+)
+
+dupes = out.duplicated(subset=["company_id", "filing_date", "form_type"])
+assert dupes.sum() == 0, f"Found {dupes.sum()} duplicate rows"
+
+assert out["company_id"].isin(spine["company_id"]).all(), (
+    "Found company_ids not present in spine"
+)
+
+if len(out) > 0:
+    assert (out["match_score"] >= FUZZY_THRESHOLD).all(), (
+        f"Found match scores below {FUZZY_THRESHOLD}"
+    )
+    assert pd.api.types.is_datetime64_any_dtype(out["filing_date"]), (
+        "filing_date is not datetime"
+    )
+    future = out["filing_date"] > pd.Timestamp.now()
+    assert future.sum() == 0, f"Found {future.sum()} future filing dates"
+
+print("Postcondition tests passed")
+print(f"  Rows: {len(out)}")
+print(f"  Columns: {out.columns.tolist()}")
+```

@@ -1,0 +1,439 @@
+---
+title: "03e — Google Trends Search Interest"
+format: html
+---
+
+## Overview
+
+Collect 90-day Google Trends interest-over-time data for 871 early-stage companies
+in the spine. Search interest serves as a proxy for public awareness and momentum —
+companies gaining traction should show rising search volume.
+
+**Input:** `Data/companies_spine.parquet` (871 companies)
+**Output:** `Data/google_trends.csv`
+
+- Columns: `company_name`, `date`, `search_interest`, `is_ambiguous_name`
+- One row per company per week (pytrends returns weekly data for 90-day windows)
+- `is_ambiguous_name` flags company names that are common English words
+
+Install required packages
+```{python}
+#| eval: false
+%pip install pytrends pandas pyarrow
+```
+
+Imports and configuration
+```{python}
+from pathlib import Path
+import pandas as pd
+import time
+import random
+from datetime import datetime
+from pytrends.request import TrendReq
+
+PROJECT_ROOT = Path.cwd()
+if (PROJECT_ROOT / "Data" / "companies_spine.parquet").exists():
+    DATA_DIR = PROJECT_ROOT / "Data"
+elif (PROJECT_ROOT.parent / "Data" / "companies_spine.parquet").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+    DATA_DIR = PROJECT_ROOT / "Data"
+elif (PROJECT_ROOT.parent.parent / "Data" / "companies_spine.parquet").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent.parent
+    DATA_DIR = PROJECT_ROOT / "Data"
+else:
+    raise FileNotFoundError("Cannot find Data/companies_spine.parquet")
+
+OUTPUT_PATH = DATA_DIR / "google_trends.csv"
+BATCH_SIZE = 5          # pytrends max keywords per request
+SLEEP_MIN = 2.0         # min seconds between batches
+SLEEP_MAX = 4.0         # max seconds (randomized to avoid pattern detection)
+MAX_RETRIES = 3         # retries per batch on 429/failure
+RETRY_BACKOFF = 30.0    # base backoff seconds on 429 (doubles each retry)
+
+print(f"Data dir: {DATA_DIR}")
+print(f"Output:   {OUTPUT_PATH}")
+```
+
+## Ambiguous Name Detection
+
+Flag company names that are common English words — these will return inflated
+search interest that reflects the word, not the company (e.g., "Notion", "Stripe",
+"Runway", "Scale").
+```{python}
+COMMON_WORDS = {
+    "a", "able", "about", "abstract", "account", "ace", "act", "active",
+    "actual", "add", "advance", "agent", "air", "align", "all", "alpha",
+    "also", "always", "amp", "anchor", "angel", "ant", "any", "anything",
+    "apex", "app", "apple", "apply", "arc", "arch", "area", "arena", "ark",
+    "arm", "armor", "arrow", "art", "atlas", "atom", "auto", "aware",
+    "axis", "back", "balance", "band", "bank", "bar", "base", "basis",
+    "bat", "bay", "beam", "bear", "bed", "bell", "bench", "bend", "berry",
+    "best", "beta", "big", "bird", "bit", "black", "blade", "blank",
+    "blast", "blend", "blink", "block", "bloom", "blue", "board", "bolt",
+    "bond", "bone", "book", "boost", "border", "bounce", "box", "branch",
+    "brave", "break", "breeze", "brick", "bridge", "bright", "bring",
+    "broad", "brush", "bubble", "build", "bulk", "bump", "bundle", "burst",
+    "cabin", "cake", "calm", "camp", "can", "canvas", "cap", "cape",
+    "carbon", "card", "care", "carry", "cart", "cast", "catch", "cave",
+    "cell", "center", "chain", "chair", "chalk", "chance", "change",
+    "channel", "charm", "chart", "chase", "check", "chief", "circle",
+    "civic", "claim", "clamp", "clap", "class", "clay", "clean", "clear",
+    "click", "climb", "clip", "clock", "close", "cloud", "club", "clue",
+    "cluster", "coast", "coat", "code", "coin", "color", "column",
+    "combine", "come", "command", "common", "company", "compass",
+    "complete", "compose", "compound", "concept", "concord", "concourse",
+    "cone", "connect", "console", "construct", "content", "contrast",
+    "control", "convert", "cool", "copper", "copy", "coral", "cord",
+    "core", "corner", "cost", "cotton", "count", "course", "cover",
+    "craft", "crane", "crash", "create", "crew", "cross", "crowd",
+    "crown", "crush", "cube", "cup", "cure", "current", "curve", "custom",
+    "cut", "cycle", "daily", "dance", "dark", "dart", "dash", "data",
+    "dawn", "deal", "deck", "deep", "delta", "den", "desert", "design",
+    "desk", "dial", "digit", "direct", "disc", "dish", "dock", "domain",
+    "dome", "door", "dot", "double", "draft", "dragon", "drain", "draw",
+    "dream", "dress", "drift", "drill", "drink", "drive", "drop", "drum",
+    "dry", "duck", "dune", "dust", "duty", "eagle", "earth", "ease",
+    "east", "echo", "edge", "element", "emerge", "empire", "end", "engine",
+    "equal", "era", "even", "ever", "every", "exact", "expand", "explore",
+    "express", "extend", "extra", "eye", "face", "fact", "fair", "fall",
+    "fame", "fan", "far", "farm", "fast", "fate", "favor", "feed", "feel",
+    "fence", "field", "figure", "fill", "film", "filter", "final", "find",
+    "fine", "fire", "firm", "first", "fish", "fit", "five", "fix", "flag",
+    "flame", "flare", "flash", "flat", "fleet", "flex", "flight", "flip",
+    "float", "flock", "floor", "flow", "fly", "foam", "focus", "fold",
+    "follow", "font", "foot", "force", "forge", "form", "fort", "forward",
+    "fossil", "found", "fountain", "four", "fox", "frame", "free", "fresh",
+    "friend", "front", "frost", "fruit", "fuel", "full", "fund", "fuse",
+    "gain", "game", "gap", "garden", "gate", "gauge", "gear", "gem",
+    "general", "gentle", "ghost", "giant", "gift", "glad", "glass",
+    "gleam", "glide", "glow", "go", "goal", "gold", "good", "grab",
+    "grace", "grain", "grand", "grant", "grape", "grasp", "grass", "gray",
+    "great", "green", "grid", "grip", "ground", "grove", "grow", "growth",
+    "guard", "guide", "gulf", "gust", "habit", "half", "hall", "hammer",
+    "hand", "handle", "harbor", "hard", "harvest", "hatch", "haven",
+    "hawk", "head", "heal", "heap", "heart", "heat", "heavy", "hedge",
+    "hero", "hide", "high", "hill", "hive", "hold", "hole", "home",
+    "honey", "hood", "hook", "hope", "horizon", "horn", "host", "hour",
+    "house", "hub", "hue", "human", "humble", "hunt", "ice", "idea",
+    "image", "impact", "inch", "index", "ink", "inner", "input", "insight",
+    "instant", "intact", "intent", "ion", "iron", "island", "item", "ivory",
+    "jade", "jam", "jar", "jet", "jewel", "join", "joint", "joy", "juice",
+    "jump", "jungle", "just", "keen", "keep", "kernel", "key", "kind",
+    "king", "kit", "kite", "knot", "know", "label", "lace", "lake",
+    "lamp", "land", "lane", "lark", "laser", "last", "late", "launch",
+    "lava", "lawn", "layer", "lead", "leaf", "lean", "leap", "learn",
+    "left", "lemon", "lens", "less", "letter", "level", "lever", "liberty",
+    "lift", "light", "lily", "lime", "limit", "line", "link", "lion",
+    "list", "live", "load", "lock", "loft", "log", "long", "look", "loop",
+    "lot", "loud", "love", "low", "luck", "lure", "lush", "machine",
+    "magic", "main", "make", "manor", "map", "maple", "marble", "march",
+    "mark", "market", "marsh", "mask", "mass", "master", "match", "matter",
+    "maze", "meadow", "mean", "measure", "media", "meet", "melt", "memo",
+    "merge", "merit", "mesa", "mesh", "metal", "method", "middle", "might",
+    "mild", "mile", "mill", "mind", "mine", "mint", "mirror", "mix",
+    "mode", "model", "mold", "moment", "moon", "moral", "moss", "motion",
+    "motor", "mount", "mouse", "move", "much", "mud", "muse", "must",
+    "nail", "name", "narrow", "nature", "near", "neat", "nest", "net",
+    "neutral", "new", "next", "nice", "night", "nine", "noble", "node",
+    "noise", "noon", "norm", "north", "nose", "note", "notion", "novel",
+    "now", "number", "oak", "oar", "ocean", "odd", "offer", "oil", "old",
+    "olive", "one", "open", "option", "orbit", "order", "origin", "other",
+    "outer", "oval", "own", "pace", "pack", "paddle", "page", "pair",
+    "palm", "pan", "panel", "paper", "park", "part", "pass", "past",
+    "patch", "path", "pattern", "pause", "pave", "pay", "peace", "peak",
+    "pearl", "pen", "people", "pepper", "permit", "person", "pick",
+    "piece", "pile", "pilot", "pin", "pine", "pink", "pipe", "pitch",
+    "pixel", "place", "plain", "plan", "plane", "plant", "plate", "play",
+    "plaza", "plot", "plug", "plum", "plus", "pocket", "pod", "point",
+    "polar", "pole", "polish", "pond", "pool", "port", "pose", "post",
+    "pot", "pour", "power", "press", "price", "pride", "prime", "print",
+    "prism", "prize", "probe", "proof", "proper", "prose", "proud",
+    "prove", "prune", "public", "pull", "pulse", "pump", "punch", "pure",
+    "push", "puzzle", "quartz", "queen", "quest", "quick", "quiet",
+    "quill", "quote", "race", "rack", "radar", "radio", "raft", "rail",
+    "rain", "raise", "ramp", "ranch", "range", "rank", "rapid", "rare",
+    "rate", "ratio", "raw", "ray", "reach", "read", "ready", "real",
+    "realm", "reason", "record", "red", "reef", "refine", "reform",
+    "region", "relay", "relief", "rely", "remind", "render", "renew",
+    "rent", "repeat", "reply", "report", "rescue", "reserve", "reset",
+    "resolve", "rest", "result", "reveal", "ribbon", "rich", "ride",
+    "ridge", "right", "rigid", "ring", "ripple", "rise", "river", "road",
+    "robin", "robust", "rock", "rod", "role", "roll", "roof", "room",
+    "root", "rope", "rose", "round", "route", "row", "royal", "ruin",
+    "rule", "run", "runway", "rush", "rust", "sacred", "safe", "sage",
+    "sail", "salt", "same", "sand", "sap", "save", "say", "scale",
+    "scan", "scene", "school", "scope", "score", "scout", "screen",
+    "scroll", "sea", "seal", "search", "season", "seat", "second",
+    "secret", "section", "seed", "seek", "self", "send", "sense", "serve",
+    "set", "settle", "seven", "shade", "shadow", "shaft", "shake", "shape",
+    "share", "sharp", "shed", "shell", "shelter", "shield", "shift",
+    "shine", "ship", "shock", "shore", "short", "show", "shrub", "shut",
+    "side", "siege", "sight", "sign", "signal", "silk", "silver", "simple",
+    "single", "site", "six", "size", "skill", "skin", "sky", "slate",
+    "slice", "slide", "slim", "slip", "slope", "slow", "small", "smart",
+    "smile", "smoke", "smooth", "snap", "snow", "soar", "social", "sock",
+    "soft", "soil", "solar", "solid", "solo", "solve", "song", "sort",
+    "soul", "sound", "source", "south", "space", "span", "spark", "speak",
+    "special", "speed", "sphere", "spice", "spin", "spirit", "splash",
+    "split", "spoke", "sport", "spot", "spread", "spring", "square",
+    "stable", "stack", "staff", "stage", "stair", "stake", "stamp",
+    "stand", "star", "start", "state", "stay", "steady", "steam", "steel",
+    "stem", "step", "stick", "still", "stitch", "stock", "stone", "stop",
+    "store", "storm", "story", "stove", "straight", "strand", "stream",
+    "street", "strength", "stretch", "stride", "strike", "string", "strip",
+    "stripe", "strong", "study", "style", "subject", "subtle", "sugar",
+    "suit", "summer", "summit", "sun", "super", "supply", "support",
+    "sure", "surface", "surge", "sustain", "sweet", "swift", "swim",
+    "swing", "switch", "symbol", "sync", "system", "table", "tackle",
+    "tail", "talent", "talk", "tall", "tank", "tap", "tape", "target",
+    "task", "taste", "team", "temple", "ten", "term", "terrain", "test",
+    "text", "theme", "theory", "thick", "thin", "thing", "think", "third",
+    "thorn", "thought", "thread", "three", "thrive", "throw", "thumb",
+    "tide", "tie", "tiger", "tile", "timber", "time", "tiny", "tip",
+    "title", "toast", "token", "tone", "tool", "top", "topic", "torch",
+    "total", "touch", "tough", "tour", "tower", "town", "trace", "track",
+    "trade", "trail", "train", "trait", "trap", "travel", "treat", "tree",
+    "trend", "trial", "tribe", "trick", "trim", "trip", "triumph", "troop",
+    "true", "trust", "truth", "tube", "tulip", "tunnel", "turn", "turtle",
+    "tutor", "twelve", "twice", "twin", "twist", "two", "type", "ultra",
+    "uncle", "under", "union", "unique", "unit", "unity", "until", "upper",
+    "urban", "use", "usual", "valley", "value", "valve", "vapor", "vast",
+    "vault", "venture", "verb", "verse", "very", "vessel", "vest", "view",
+    "vigor", "vine", "violet", "virtual", "vision", "visit", "vital",
+    "vivid", "voice", "void", "volt", "volume", "vote", "voyage", "wade",
+    "wage", "wagon", "wait", "wake", "walk", "wall", "wander", "want",
+    "ward", "warm", "warn", "wash", "waste", "watch", "water", "wave",
+    "way", "wealth", "web", "wedge", "week", "weight", "well", "west",
+    "wheat", "wheel", "while", "whisper", "white", "whole", "wide", "wild",
+    "will", "win", "wind", "window", "wine", "wing", "winter", "wire",
+    "wise", "wish", "wolf", "wonder", "wood", "wool", "word", "work",
+    "world", "worth", "wrap", "write", "yard", "year", "yellow", "yet",
+    "yield", "young", "zero", "zinc", "zone",
+}
+
+
+def is_ambiguous_name(name: str) -> bool:
+    """Check if a company name is a common English word (case-insensitive).
+    Single-word names that match common words will inflate Trends results."""
+    cleaned = name.strip().lower()
+    # Only flag single-word names or two-word names where both are common
+    words = cleaned.split()
+    if len(words) == 1:
+        return cleaned in COMMON_WORDS
+    if len(words) == 2:
+        return all(w in COMMON_WORDS for w in words)
+    return False
+```
+
+Load the company spine and flag ambiguous names
+```{python}
+spine = pd.read_parquet(DATA_DIR / "companies_spine.parquet")
+print(f"Loaded {len(spine)} companies")
+
+company_names = spine["name"].dropna().unique().tolist()
+print(f"Unique company names: {len(company_names)}")
+
+ambiguous = [n for n in company_names if is_ambiguous_name(n)]
+print(f"Ambiguous names flagged: {len(ambiguous)}")
+if ambiguous:
+    print(f"  Examples: {ambiguous[:15]}")
+```
+
+## Google Trends Collection
+
+Initialize pytrends and define the collection function
+```{python}
+pytrends = TrendReq(hl="en-US", tz=360)
+
+
+def fetch_trends_batch(keywords: list[str], retries: int = MAX_RETRIES) -> pd.DataFrame | None:
+    """Fetch 90-day interest-over-time for up to 5 keywords.
+    Returns a DataFrame with columns = keyword names and index = dates,
+    or None if all retries fail."""
+    for attempt in range(retries):
+        try:
+            pytrends.build_payload(keywords, cat=0, timeframe="today 3-m", geo="", gprop="")
+            df = pytrends.interest_over_time()
+            if df is not None and not df.empty:
+                # Drop the 'isPartial' column pytrends adds
+                if "isPartial" in df.columns:
+                    df = df.drop(columns=["isPartial"])
+                return df
+            return None
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "Too Many Requests" in err:
+                wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 5)
+                print(f"    429 hit — backing off {wait:.0f}s (attempt {attempt + 1}/{retries})")
+                time.sleep(wait)
+            else:
+                print(f"    Error: {err} (attempt {attempt + 1}/{retries})")
+                time.sleep(5)
+
+    return None
+```
+
+Run the collection across all companies in batches of 5
+```{python}
+all_rows = []
+failed_companies = []
+
+# Build batches
+batches = [company_names[i : i + BATCH_SIZE] for i in range(0, len(company_names), BATCH_SIZE)]
+total_batches = len(batches)
+print(f"Total companies: {len(company_names)}")
+print(f"Batch size: {BATCH_SIZE}")
+print(f"Total batches: {total_batches}")
+print(f"Estimated time: {total_batches * 3 / 60:.0f}–{total_batches * 5 / 60:.0f} min\n")
+
+for batch_idx, batch in enumerate(batches, 1):
+    if batch_idx % 20 == 1:
+        print(f"[Batch {batch_idx}/{total_batches}] Processing: {batch}")
+
+    result = fetch_trends_batch(batch)
+
+    if result is not None:
+        # Melt from wide (one col per keyword) to long format
+        for keyword in batch:
+            if keyword in result.columns:
+                series = result[keyword].reset_index()
+                series.columns = ["date", "search_interest"]
+                series["company_name"] = keyword
+                series["is_ambiguous_name"] = is_ambiguous_name(keyword)
+                all_rows.append(series)
+            else:
+                # Keyword returned no data (zero volume)
+                failed_companies.append({"company_name": keyword, "reason": "no_data_returned"})
+    else:
+        # Entire batch failed
+        for keyword in batch:
+            failed_companies.append({"company_name": keyword, "reason": "batch_failed"})
+
+    # Rate limiting with jitter
+    sleep_time = random.uniform(SLEEP_MIN, SLEEP_MAX)
+    time.sleep(sleep_time)
+
+print(f"\nCollection done.")
+print(f"  Companies with data: {len(set(r['company_name'].iloc[0] for r in all_rows)) if all_rows else 0}")
+print(f"  Failed companies: {len(failed_companies)}")
+```
+
+## Assemble and Export
+
+Combine all results into the final output
+```{python}
+if all_rows:
+    trends_df = pd.concat(all_rows, ignore_index=True)
+    # Reorder columns
+    trends_df = trends_df[["company_name", "date", "search_interest", "is_ambiguous_name"]]
+    trends_df = trends_df.sort_values(["company_name", "date"]).reset_index(drop=True)
+else:
+    trends_df = pd.DataFrame(columns=["company_name", "date", "search_interest", "is_ambiguous_name"])
+
+print(f"Output shape: {trends_df.shape}")
+print(f"Unique companies: {trends_df['company_name'].nunique()}")
+print(f"Date range: {trends_df['date'].min()} to {trends_df['date'].max()}" if len(trends_df) > 0 else "No data")
+trends_df.head(10)
+```
+
+Save to CSV
+```{python}
+trends_df.to_csv(OUTPUT_PATH, index=False)
+print(f"Saved {len(trends_df)} rows to {OUTPUT_PATH}")
+```
+
+## Failed Companies Log
+
+Review which companies had no data or failed entirely
+```{python}
+if failed_companies:
+    failed_df = pd.DataFrame(failed_companies)
+    print(f"Total failures: {len(failed_df)}")
+    print(f"\nBy reason:")
+    print(failed_df["reason"].value_counts().to_string())
+    print(f"\nFirst 30 failed companies:")
+    for row in failed_companies[:30]:
+        print(f"  {row['company_name']}: {row['reason']}")
+    if len(failed_companies) > 30:
+        print(f"  ... and {len(failed_companies) - 30} more")
+
+    # Save failures log
+    failed_df.to_csv(DATA_DIR / "google_trends_failures.csv", index=False)
+    print(f"\nSaved failure log to {DATA_DIR / 'google_trends_failures.csv'}")
+else:
+    print("No failures!")
+```
+
+## Summary Statistics
+
+```{python}
+if len(trends_df) > 0:
+    print("=== Google Trends Collection Summary ===")
+    print(f"Companies with data: {trends_df['company_name'].nunique()}/{len(company_names)}")
+    print(f"Total rows: {len(trends_df)}")
+    print(f"Date range: {trends_df['date'].min()} to {trends_df['date'].max()}")
+    print(f"Ambiguous names: {trends_df[trends_df['is_ambiguous_name']]['company_name'].nunique()}")
+
+    print(f"\n--- Search interest distribution ---")
+    print(trends_df["search_interest"].describe().to_string())
+
+    # Per-company average interest
+    avg_interest = trends_df.groupby("company_name")["search_interest"].mean()
+    print(f"\n--- Per-company avg interest ---")
+    print(avg_interest.describe().to_string())
+
+    print(f"\n--- Top 10 by avg search interest ---")
+    top = avg_interest.nlargest(10)
+    for name, val in top.items():
+        flag = " [AMBIGUOUS]" if is_ambiguous_name(name) else ""
+        print(f"  {name}: {val:.1f}{flag}")
+
+    print(f"\n--- Bottom 10 (lowest non-zero) ---")
+    nonzero = avg_interest[avg_interest > 0].nsmallest(10)
+    for name, val in nonzero.items():
+        print(f"  {name}: {val:.1f}")
+
+    # Ambiguous vs non-ambiguous comparison
+    amb = trends_df[trends_df["is_ambiguous_name"]]["search_interest"].mean()
+    non_amb = trends_df[~trends_df["is_ambiguous_name"]]["search_interest"].mean()
+    print(f"\n--- Ambiguous name effect ---")
+    print(f"  Avg interest (ambiguous names):     {amb:.1f}")
+    print(f"  Avg interest (non-ambiguous names):  {non_amb:.1f}")
+else:
+    print("No data collected — check failures log above.")
+```
+
+## Unit Tests
+
+Precondition and postcondition tests
+```{python}
+# ---- Precondition tests ----
+assert "name" in spine.columns, "Spine missing name column"
+assert len(spine) > 0, "Spine is empty"
+assert len(company_names) > 0, "No company names extracted"
+print("Precondition tests passed")
+
+# ---- Postcondition tests ----
+output = pd.read_csv(OUTPUT_PATH)
+
+expected_cols = {"company_name", "date", "search_interest", "is_ambiguous_name"}
+assert expected_cols == set(output.columns), (
+    f"Column mismatch: expected {expected_cols}, got {set(output.columns)}"
+)
+
+# search_interest should be non-negative integers (0-100 scale from Google)
+if len(output) > 0:
+    assert (output["search_interest"] >= 0).all(), "Negative search_interest found"
+    assert (output["search_interest"] <= 100).all(), "search_interest > 100 found"
+    assert output["company_name"].isin(company_names).all(), (
+        "Found company names not in spine"
+    )
+    assert output["is_ambiguous_name"].dtype == bool or set(output["is_ambiguous_name"].unique()).issubset({True, False}), (
+        "is_ambiguous_name should be boolean"
+    )
+
+print("Postcondition tests passed")
+print(f"  Output rows: {len(output)}")
+print(f"  Output columns: {output.columns.tolist()}")
+print(f"  Companies with data: {output['company_name'].nunique()}")
+```

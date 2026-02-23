@@ -1,0 +1,581 @@
+---
+title: "03d — GitHub Developer Activity"
+format: html
+---
+
+## Overview
+
+Collect GitHub developer activity signals for 871 early-stage companies in the spine.
+The `github_url` column is empty, so we first discover each company's GitHub org by
+matching organization profile URLs against spine domains, then collect repo-level
+activity data (commits, stars, forks, contributors).
+
+**Input:** `Data/companies_spine.parquet` (871 companies)
+**Output:**
+- `Data/github_org_matches.parquet` — company → GitHub org mapping
+- `Data/github_repos.parquet` — repo-level activity data
+- `Data/github_activity_summary.parquet` — one row per 871 companies
+
+Install required packages
+```{python}
+#| eval: false
+%pip install requests pandas pyarrow numpy
+```
+
+Paste your GitHub PAT below (needs no special scopes — public repo read access is enough)
+```{python}
+import os
+os.environ["GITHUB_TOKEN"] = ""
+```
+
+Imports and configuration
+```{python}
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import requests
+import time
+import os
+from datetime import datetime
+from urllib.parse import urlparse
+
+PROJECT_ROOT = Path.cwd()
+if (PROJECT_ROOT / "Data" / "companies_spine.parquet").exists():
+    DATA_DIR = PROJECT_ROOT / "Data"
+elif (PROJECT_ROOT.parent / "Data" / "companies_spine.parquet").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+    DATA_DIR = PROJECT_ROOT / "Data"
+elif (PROJECT_ROOT.parent.parent / "Data" / "companies_spine.parquet").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent.parent
+    DATA_DIR = PROJECT_ROOT / "Data"
+else:
+    raise FileNotFoundError("Cannot find Data/companies_spine.parquet")
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+if GITHUB_TOKEN:
+    print("GITHUB_TOKEN found — authenticated (5000 req/hr)")
+    GITHUB_HEADERS = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+else:
+    print("WARNING: GITHUB_TOKEN not set — unauthenticated (60 req/hr)")
+    print("Set GITHUB_TOKEN env var with a GitHub PAT for usable rate limits.")
+    GITHUB_HEADERS = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+SEARCH_RATE_DELAY = 2.0   # seconds between search API calls
+REST_RATE_DELAY = 0.3      # seconds between REST API calls (5000/hr budget = 83/min, plenty of headroom)
+STALE_DAYS = 180           # skip stats for repos not pushed in 6+ months
+GITHUB_API = "https://api.github.com"
+TODAY = pd.Timestamp.now(tz="UTC")
+
+```
+
+Load the company spine
+```{python}
+spine = pd.read_parquet(DATA_DIR / "companies_spine.parquet")
+print(f"Loaded {len(spine)} companies")
+
+has_domain = spine["domain"].notna() & (spine["domain"].str.strip() != "")
+print(f"Companies with domains: {has_domain.sum()}/{len(spine)}")
+spine[["company_id", "name", "domain"]].head()
+```
+
+## Helper Functions
+
+Domain normalization, GitHub API wrappers, and org search
+```{python}
+def normalize_domain(raw: str) -> str:
+    """Strip protocol, www, trailing slash, and path from a URL/domain."""
+    if not raw or not isinstance(raw, str):
+        return ""
+    s = raw.strip().lower()
+    # Add scheme if missing so urlparse works
+    if not s.startswith(("http://", "https://")):
+        s = "https://" + s
+    parsed = urlparse(s)
+    host = parsed.hostname or ""
+    # Strip www.
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _handle_rate_limit(resp):
+    """Check rate limit headers and sleep if exhausted. Caps sleep at 90s."""
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    if remaining is not None and int(remaining) == 0:
+        reset_ts = int(resp.headers.get("X-RateLimit-Reset", 0))
+        wait = max(reset_ts - time.time(), 0) + 1
+        limit = resp.headers.get("X-RateLimit-Limit", "?")
+        resource = resp.headers.get("X-RateLimit-Resource", "unknown")
+        if wait > 90:
+            print(f"  Rate limit ({resource}, limit={limit}) — would sleep {wait:.0f}s, capping at 90s")
+            wait = 90
+        else:
+            print(f"  Rate limit ({resource}, limit={limit}) — sleeping {wait:.0f}s")
+        time.sleep(wait)
+
+
+def fetch_json(url: str, params: dict = None) -> tuple:
+    """GET a GitHub API endpoint. Returns (data, response).
+    Auto-sleeps if rate limit is exhausted."""
+    resp = requests.get(url, headers=GITHUB_HEADERS, params=params, timeout=30)
+    _handle_rate_limit(resp)
+    resp.raise_for_status()
+    return resp.json(), resp
+
+
+def fetch_stats_with_retry(url: str, max_retries: int = 3) -> list | None:
+    """Fetch a GitHub stats endpoint, retrying on 202 (computing) responses."""
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=GITHUB_HEADERS, timeout=30)
+        _handle_rate_limit(resp)
+
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 202:
+            # GitHub is computing stats, retry after delay
+            time.sleep(2)
+            continue
+        elif resp.status_code == 204:
+            # No content (empty repo)
+            return []
+        else:
+            resp.raise_for_status()
+    return None  # Exhausted retries
+
+
+def search_github_org(name: str, domain: str) -> dict | None:
+    """Search for a GitHub org matching a company name, then verify via domain.
+    Returns {"login": ..., "blog": ..., "match_method": "domain"} or None."""
+    if not domain:
+        return None
+
+    norm_domain = normalize_domain(domain)
+    if not norm_domain:
+        return None
+
+    # Search for orgs matching the company name
+    query = f"{name} type:org"
+    url = f"{GITHUB_API}/search/users"
+    params = {"q": query, "per_page": 5}
+
+    try:
+        data, _ = fetch_json(url, params)
+    except requests.exceptions.HTTPError:
+        return None
+
+    candidates = data.get("items", [])
+    if not candidates:
+        return None
+
+    # Check each candidate's org profile for a matching blog/website
+    for candidate in candidates:
+        login = candidate.get("login", "")
+        try:
+            time.sleep(REST_RATE_DELAY)
+            org_data, _ = fetch_json(f"{GITHUB_API}/orgs/{login}")
+        except requests.exceptions.HTTPError:
+            continue
+
+        blog = org_data.get("blog", "") or ""
+        org_domain = normalize_domain(blog)
+        if org_domain and org_domain == norm_domain:
+            return {
+                "login": login,
+                "blog": blog,
+                "match_method": "domain",
+            }
+
+    return None
+```
+
+## Phase 1 — Discover GitHub Orgs
+
+Search GitHub for each company's org, matching by domain.
+Tracks ALL searched company IDs (matches + no-matches) so re-runs skip instantly.
+```{python}
+org_matches = []
+errors = []
+
+# Resume: load existing matches
+checkpoint_path = DATA_DIR / "github_org_matches.parquet"
+searched_path = DATA_DIR / "github_org_searched_ids.csv"
+
+if checkpoint_path.exists():
+    existing = pd.read_parquet(checkpoint_path)
+    org_matches = existing.to_dict("records")
+    print(f"Loaded {len(org_matches)} existing org matches")
+
+# Resume: load ALL previously searched IDs (matches + no-matches)
+searched_ids = set()
+if searched_path.exists():
+    searched_df = pd.read_csv(searched_path)
+    searched_ids = set(searched_df["company_id"])
+    print(f"Already searched: {len(searched_ids)}/{len(spine)} companies (skipping)")
+
+remaining = [row for row in spine.itertuples() if row.company_id not in searched_ids]
+print(f"Remaining to search: {len(remaining)}")
+searched_ids_list = list(searched_ids)
+
+for i, row in enumerate(remaining, 1):
+    company_id = row.company_id
+    name = row.name
+    domain = row.domain if pd.notna(row.domain) else ""
+
+    try:
+        result = search_github_org(name, domain)
+        if result:
+            org_matches.append({
+                "company_id": company_id,
+                "name": name,
+                "domain": domain,
+                "github_org": result["login"],
+                "github_url": f"https://github.com/{result['login']}",
+                "match_method": result["match_method"],
+            })
+            print(f"[{i}/{len(remaining)}] {name}... MATCHED -> {result['login']}")
+        else:
+            if i <= 5 or i % 50 == 0:
+                print(f"[{i}/{len(remaining)}] {name}... no match")
+    except Exception as e:
+        errors.append({"company_id": company_id, "name": name,
+                        "error": str(e), "phase": "org_discovery"})
+        print(f"[{i}/{len(remaining)}] {name}... ERROR: {e}")
+
+    searched_ids_list.append(company_id)
+
+    # Auto-save checkpoints every 50 companies
+    if i % 50 == 0:
+        if org_matches:
+            pd.DataFrame(org_matches).to_parquet(checkpoint_path, index=False)
+        pd.DataFrame({"company_id": searched_ids_list}).to_csv(searched_path, index=False)
+        print(f"  [checkpoint — {len(org_matches)} matches, {len(searched_ids_list)} searched]")
+
+    time.sleep(SEARCH_RATE_DELAY)
+
+# Final save
+if org_matches:
+    pd.DataFrame(org_matches).to_parquet(checkpoint_path, index=False)
+pd.DataFrame({"company_id": searched_ids_list}).to_csv(searched_path, index=False)
+
+print(f"\nPhase 1 done: {len(org_matches)} orgs matched, {len(errors)} errors")
+print(f"  Total searched: {len(searched_ids_list)}/{len(spine)}")
+```
+
+Save Phase 1 checkpoint
+```{python}
+org_df = pd.DataFrame(org_matches)
+if len(org_df) == 0:
+    org_df = pd.DataFrame(columns=[
+        "company_id", "name", "domain", "github_org", "github_url", "match_method"
+    ])
+org_df.to_parquet(DATA_DIR / "github_org_matches.parquet", index=False)
+print(f"Saved {len(org_df)} org matches to {DATA_DIR / 'github_org_matches.parquet'}")
+org_df.head(10)
+```
+
+## Phase 2 — Collect Repos + Activity
+
+For each matched org, list repos and fetch activity metrics
+```{python}
+repo_records = []
+
+# Resume from checkpoint if available
+repos_checkpoint = DATA_DIR / "github_repos.parquet"
+seen_orgs = set()
+if repos_checkpoint.exists():
+    existing_repos = pd.read_parquet(repos_checkpoint)
+    repo_records = existing_repos.to_dict("records")
+    seen_orgs = set(existing_repos["github_org"])
+    print(f"Resuming: {len(seen_orgs)} orgs already processed")
+
+# Build org -> company_id lookup
+org_lookup = {}
+for rec in org_matches:
+    org_lookup[rec["github_org"]] = rec["company_id"]
+
+orgs_to_process = [
+    rec for rec in org_matches if rec["github_org"] not in seen_orgs
+]
+print(f"Processing {len(orgs_to_process)} orgs...")
+
+for oi, org_rec in enumerate(orgs_to_process, 1):
+    org_login = org_rec["github_org"]
+    company_id = org_rec["company_id"]
+
+    try:
+        # Paginate through all public repos
+        repos = []
+        page = 1
+        while True:
+            time.sleep(REST_RATE_DELAY)
+            data, _ = fetch_json(
+                f"{GITHUB_API}/orgs/{org_login}/repos",
+                params={"per_page": 100, "page": page, "type": "public"},
+            )
+            if not data:
+                break
+            repos.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+
+        print(f"[{oi}/{len(orgs_to_process)}] {org_login}: {len(repos)} repos")
+
+        # Extract metadata from listing (no extra API calls needed)
+        for repo in repos:
+            created = pd.to_datetime(repo.get("created_at"))
+            pushed = pd.to_datetime(repo.get("pushed_at"))
+
+            repo_records.append({
+                "company_id": company_id,
+                "github_org": org_login,
+                "repo_name": repo.get("name", ""),
+                "full_name": repo["full_name"],
+                "description": repo.get("description", ""),
+                "stars": repo.get("stargazers_count", 0),
+                "forks": repo.get("forks_count", 0),
+                "open_issues": repo.get("open_issues_count", 0),
+                "size_kb": repo.get("size", 0),
+                "language": repo.get("language"),
+                "created_at": created,
+                "pushed_at": pushed,
+                "repo_age_days": (TODAY - created).days if pd.notna(created) else None,
+                "days_since_push": (TODAY - pushed).days if pd.notna(pushed) else None,
+            })
+
+    except Exception as e:
+        errors.append({"company_id": company_id, "name": org_login,
+                        "error": str(e), "phase": "repo_collection"})
+        print(f"[{oi}/{len(orgs_to_process)}] {org_login}: ERROR — {e}")
+
+    # Auto-save checkpoint every 25 orgs
+    if oi % 25 == 0 and repo_records:
+        pd.DataFrame(repo_records).to_parquet(repos_checkpoint, index=False)
+        print(f"  [checkpoint — {len(repo_records)} repo records from {oi} orgs]")
+
+# Final save
+if repo_records:
+    pd.DataFrame(repo_records).to_parquet(repos_checkpoint, index=False)
+
+print(f"\nPhase 2 done: {len(repo_records)} total repo records")
+```
+
+Save Phase 2 checkpoint
+```{python}
+repos_df = pd.DataFrame(repo_records)
+if len(repos_df) == 0:
+    repos_df = pd.DataFrame(columns=[
+        "company_id", "github_org", "repo_name", "full_name", "description",
+        "stars", "forks", "open_issues", "size_kb", "language",
+        "created_at", "pushed_at", "repo_age_days", "days_since_push",
+    ])
+repos_df.to_parquet(DATA_DIR / "github_repos.parquet", index=False)
+print(f"Saved {len(repos_df)} repo records to {DATA_DIR / 'github_repos.parquet'}")
+repos_df.head(10)
+```
+
+## Error Review
+
+Total count, phase breakdown, and first 20 errors
+```{python}
+print(f"Total errors: {len(errors)}")
+if errors:
+    err_df = pd.DataFrame(errors)
+    print(f"\nBy phase:")
+    print(err_df["phase"].value_counts().to_string())
+    print(f"\nFirst 20 errors:")
+    for e in errors[:20]:
+        print(f"  [{e['phase']}] {e['name']}: {e['error']}")
+    if len(errors) > 20:
+        print(f"  ... and {len(errors) - 20} more")
+else:
+    print("No errors!")
+```
+
+## Phase 3 — Aggregate to Company Level
+
+Compute company-level GitHub activity metrics from repo listing data
+```{python}
+# Reload from parquets for independence
+org_df = pd.read_parquet(DATA_DIR / "github_org_matches.parquet")
+repos_df = pd.read_parquet(DATA_DIR / "github_repos.parquet")
+spine = pd.read_parquet(DATA_DIR / "companies_spine.parquet")
+
+summary_rows = []
+matched_company_ids = set(org_df["company_id"]) if len(org_df) > 0 else set()
+
+for _, row in spine.iterrows():
+    cid = row["company_id"]
+
+    if cid not in matched_company_ids or len(repos_df) == 0:
+        summary_rows.append({
+            "company_id": cid,
+            "repo_count": 0,
+            "total_stars": 0,
+            "total_forks": 0,
+            "total_open_issues": 0,
+            "stars_per_day": None,
+            "min_days_since_push": None,
+            "active_repos_30d": 0,
+            "active_repos_90d": 0,
+            "primary_language": None,
+            "github_org": org_df.loc[org_df["company_id"] == cid, "github_org"].iloc[0]
+                if cid in matched_company_ids else None,
+            "has_github": cid in matched_company_ids,
+        })
+        continue
+
+    company_repos = repos_df[repos_df["company_id"] == cid]
+    repo_count = len(company_repos)
+    total_stars = int(company_repos["stars"].sum())
+    total_forks = int(company_repos["forks"].sum())
+    total_open_issues = int(company_repos["open_issues"].sum())
+
+    # Stars per day: total_stars / oldest repo age
+    ages = company_repos["repo_age_days"].dropna()
+    oldest_age = ages.max() if len(ages) > 0 else None
+    stars_per_day = (total_stars / oldest_age) if oldest_age and oldest_age > 0 else None
+
+    # Push recency: how recently was ANY repo pushed? (lower = more active)
+    push_days = company_repos["days_since_push"].dropna()
+    min_days_since_push = int(push_days.min()) if len(push_days) > 0 else None
+
+    # Active repo counts: how many repos were pushed in last 30/90 days
+    active_30d = int((push_days < 30).sum()) if len(push_days) > 0 else 0
+    active_90d = int((push_days < 90).sum()) if len(push_days) > 0 else 0
+
+    # Primary language
+    langs = company_repos["language"].dropna()
+    primary_lang = langs.mode().iloc[0] if len(langs) > 0 else None
+
+    github_org = org_df.loc[org_df["company_id"] == cid, "github_org"].iloc[0]
+
+    summary_rows.append({
+        "company_id": cid,
+        "repo_count": repo_count,
+        "total_stars": total_stars,
+        "total_forks": total_forks,
+        "total_open_issues": total_open_issues,
+        "stars_per_day": stars_per_day,
+        "min_days_since_push": min_days_since_push,
+        "active_repos_30d": active_30d,
+        "active_repos_90d": active_90d,
+        "primary_language": primary_lang,
+        "github_org": github_org,
+        "has_github": True,
+    })
+
+summary = pd.DataFrame(summary_rows)
+print(f"Summary: {len(summary)} rows")
+print(f"  With GitHub: {summary['has_github'].sum()}")
+print(f"  Without GitHub: {(~summary['has_github']).sum()}")
+```
+
+Save company-level summary
+```{python}
+summary.to_parquet(DATA_DIR / "github_activity_summary.parquet", index=False)
+print(f"Saved {len(summary)} rows to {DATA_DIR / 'github_activity_summary.parquet'}")
+summary.head(10)
+```
+
+## Summary Statistics
+
+```{python}
+print(f"=== GitHub Activity Summary ===")
+print(f"Match rate: {summary['has_github'].sum()}/{len(summary)} "
+      f"({summary['has_github'].mean()*100:.1f}%)")
+
+matched = summary[summary["has_github"]]
+if len(matched) > 0:
+    print(f"\n--- Repo counts ---")
+    print(matched["repo_count"].describe().to_string())
+
+    print(f"\n--- Stars distribution ---")
+    print(matched["total_stars"].describe().to_string())
+
+    print(f"\n--- Top 10 by total stars ---")
+    top = matched.nlargest(10, "total_stars")[["company_id", "github_org", "total_stars", "repo_count"]]
+    print(top.to_string(index=False))
+
+    print(f"\n--- Push recency (days since last push) ---")
+    push = matched["min_days_since_push"].dropna()
+    if len(push) > 0:
+        print(push.describe().to_string())
+        print(f"\n  Pushed in last 7 days:  {(push <= 7).sum()}")
+        print(f"  Pushed in last 30 days: {(push <= 30).sum()}")
+        print(f"  Pushed in last 90 days: {(push <= 90).sum()}")
+        print(f"  Stale (>90 days):       {(push > 90).sum()}")
+
+    print(f"\n--- Active repos (pushed in last 90d) ---")
+    print(matched["active_repos_90d"].describe().to_string())
+
+    print(f"\n--- Primary language breakdown ---")
+    lang_counts = matched["primary_language"].value_counts().head(15)
+    print(lang_counts.to_string())
+```
+
+## Unit Tests
+
+Precondition and postcondition tests
+```{python}
+# ---- Precondition tests ----
+assert "company_id" in spine.columns, "Spine missing company_id"
+assert "name" in spine.columns, "Spine missing name"
+assert "domain" in spine.columns, "Spine missing domain"
+assert len(spine) > 0, "Spine is empty"
+print("Precondition tests passed")
+
+# ---- Postcondition tests ----
+summary_out = pd.read_parquet(DATA_DIR / "github_activity_summary.parquet")
+
+expected_cols = {
+    "company_id", "repo_count", "total_stars", "total_forks",
+    "total_open_issues", "stars_per_day", "min_days_since_push",
+    "active_repos_30d", "active_repos_90d",
+    "primary_language", "github_org", "has_github",
+}
+assert expected_cols.issubset(set(summary_out.columns)), (
+    f"Missing columns: {expected_cols - set(summary_out.columns)}"
+)
+
+assert len(summary_out) == len(spine), (
+    f"Summary has {len(summary_out)} rows, expected {len(spine)}"
+)
+
+assert summary_out["company_id"].nunique() == len(summary_out), (
+    "Duplicate company_ids in summary"
+)
+
+assert summary_out["company_id"].isin(spine["company_id"]).all(), (
+    "Found company_ids not present in spine"
+)
+
+assert (summary_out["repo_count"] >= 0).all(), "Negative repo_count found"
+assert (summary_out["total_stars"] >= 0).all(), "Negative total_stars found"
+
+# Check intermediate files
+org_out = pd.read_parquet(DATA_DIR / "github_org_matches.parquet")
+if len(org_out) > 0:
+    assert org_out["company_id"].isin(spine["company_id"]).all(), (
+        "Org matches contain company_ids not in spine"
+    )
+
+repos_out = pd.read_parquet(DATA_DIR / "github_repos.parquet")
+if len(repos_out) > 0:
+    assert repos_out["company_id"].isin(spine["company_id"]).all(), (
+        "Repos contain company_ids not in spine"
+    )
+
+print("Postcondition tests passed")
+print(f"  Summary rows: {len(summary_out)}")
+print(f"  Summary columns: {summary_out.columns.tolist()}")
+print(f"  Org matches: {len(org_out)}")
+print(f"  Repo records: {len(repos_out)}")
+```

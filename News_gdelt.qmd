@@ -1,0 +1,363 @@
+---
+title: "03c — GDELT News Mention Collection"
+format: html
+---
+
+## Overview
+
+Collect news mention volume and velocity for 871 early-stage companies using the
+GDELT DOC 2.0 API. For each company, we search the rolling 3-month window of
+global news articles and compute features: article count, average tone, unique
+sources, latest article date, and mention velocity (slope of weekly volume).
+
+**Input:** `Data/companies_spine.parquet` (871 companies)
+**Output:**
+
+- `Data/news_gdelt_articles.parquet` — raw article-level data
+- `Data/news_gdelt_summary.parquet` — one row per company with aggregated features
+
+Install required packages
+```{python}
+#| eval: false
+%pip install gdeltdoc
+```
+
+Imports and configuration
+```{python}
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import time
+import requests
+from datetime import datetime, timedelta
+from gdeltdoc import GdeltDoc, Filters
+
+PROJECT_ROOT = Path.cwd()
+if (PROJECT_ROOT / "Data" / "companies_spine.parquet").exists():
+    DATA_DIR = PROJECT_ROOT / "Data"
+elif (PROJECT_ROOT.parent / "Data" / "companies_spine.parquet").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+    DATA_DIR = PROJECT_ROOT / "Data"
+elif (PROJECT_ROOT.parent.parent / "Data" / "companies_spine.parquet").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent.parent
+    DATA_DIR = PROJECT_ROOT / "Data"
+else:
+    raise FileNotFoundError("Cannot find Data/companies_spine.parquet")
+
+TODAY = datetime.today()
+START_DATE = (TODAY - timedelta(days=90)).strftime("%Y-%m-%d")
+END_DATE = TODAY.strftime("%Y-%m-%d")
+RATE_LIMIT_DELAY = 1.0  # 1 second between API calls
+
+# Monkey-patch requests to enforce 30s timeout (gdeltdoc has no timeout param)
+_original_send = requests.Session.send
+def _patched_send(self, request, **kwargs):
+    kwargs.setdefault("timeout", 30)
+    return _original_send(self, request, **kwargs)
+requests.Session.send = _patched_send
+
+print(f"Date range: {START_DATE} to {END_DATE}")
+print(f"Data dir: {DATA_DIR}")
+```
+
+Load the company spine
+```{python}
+spine = pd.read_parquet(DATA_DIR / "companies_spine.parquet")
+print(f"Loaded {len(spine)} companies")
+spine[["company_id", "name", "domain", "industries"]].head(10)
+```
+
+## Name Disambiguation
+
+Common English words used as company names produce noisy results. For single-word
+names that appear in a stoplist, append the first industry keyword to narrow the search.
+```{python}
+COMMON_WORDS = {
+    "anything", "blaze", "metal", "even", "relay", "notion", "harbor", "haven",
+    "archer", "marble", "summit", "forge", "gather", "pilot", "signal", "stride",
+    "clarity", "scout", "tempo", "drift", "primer", "atlas", "beacon", "bridge",
+    "canvas", "carbon", "cipher", "civic", "coral", "ember", "fable", "flora",
+    "gamma", "grove", "halo", "helix", "iris", "ivory", "jade", "kernel",
+    "lumen", "maple", "nexus", "opal", "orbit", "pearl", "prism", "pulse",
+    "quilt", "realm", "ridge", "sage", "slate", "spark", "stone", "surge",
+    "tidal", "ultra", "vault", "vista", "wave", "zeal", "arbor", "strada",
+    "accord", "aspire", "bold", "brave", "bright", "calm", "clear", "coast",
+    "craft", "crest", "crown", "curve", "dash", "dawn", "deep", "delta",
+    "edge", "field", "flame", "flash", "flock", "flux", "form", "frame",
+    "front", "glow", "grain", "grid", "guide", "guild", "helm", "hive",
+    "icon", "index", "keen", "kind", "knot", "lake", "lane", "layer",
+    "leaf", "level", "light", "link", "loop", "lucid", "mark", "match",
+    "merit", "mesa", "mind", "mint", "mode", "muse", "nest", "node",
+    "north", "open", "palm", "path", "peak", "pier", "pine", "pivot",
+    "plain", "plate", "point", "pond", "port", "pure", "quest", "rain",
+    "range", "rank", "rapid", "ray", "reach", "reef", "root", "rose",
+    "route", "salt", "sand", "scale", "seed", "shape", "shelf", "shift",
+    "shore", "sight", "silk", "slope", "snap", "snow", "solid", "sound",
+    "space", "span", "spoke", "spring", "square", "stack", "stage", "stand",
+    "star", "steel", "stem", "step", "swift", "switch", "table", "terra",
+    "thread", "tide", "timber", "tone", "torch", "tower", "trace", "track",
+    "trail", "trend", "true", "trunk", "trust", "union", "unity", "upward",
+    "vale", "valor", "vibe", "vine", "vital", "vivid", "wander", "ward",
+    "weave", "well", "west", "whole", "wild", "wing", "wire", "wise",
+    "wonder", "yard", "zero", "zone",
+}
+
+
+def build_keyword(name: str, industries: str) -> str:
+    """Build a search keyword, adding industry context for ambiguous single-word names."""
+    words = name.strip().split()
+    if len(words) == 1 and name.lower() in COMMON_WORDS:
+        if pd.notna(industries) and industries.strip():
+            first_industry = industries.split(",")[0].strip()
+            return f'"{name}" "{first_industry}"'
+    return f'"{name}"'
+
+
+# Preview disambiguation
+sample = spine[spine["name"].str.lower().isin(COMMON_WORDS)].head(10)
+for _, row in sample.iterrows():
+    kw = build_keyword(row["name"], row["industries"])
+    print(f"  {row['name']:20s} -> {kw}")
+
+disambiguated = spine["name"].str.lower().isin(COMMON_WORDS).sum()
+print(f"\n{disambiguated} / {len(spine)} companies will use disambiguated keywords")
+```
+
+## Collect Articles and Timelines
+
+Query GDELT for each company: article search + timeline volume search
+```{python}
+gd = GdeltDoc()
+all_articles = []
+summary_rows = []
+errors = []
+
+for idx, row in spine.iterrows():
+    company_id = row["company_id"]
+    if company_id in {r["company_id"] for r in summary_rows}:
+        continue
+    name = row["name"]
+    industries = row["industries"] if pd.notna(row.get("industries")) else ""
+    keyword = build_keyword(name, industries)
+    print(f"[{idx + 1}/{len(spine)}] {name}...", end=" ")
+
+    article_count = 0
+    avg_tone = None
+    unique_sources = None
+    latest_article_date = None
+    mention_velocity = None
+
+    # --- Article search ---
+    try:
+        f = Filters(
+            keyword=keyword,
+            start_date=START_DATE,
+            end_date=END_DATE,
+            country="US",
+            language="English",
+            num_records=250,
+        )
+        articles = gd.article_search(f)
+
+        if articles is not None and len(articles) > 0:
+            article_count = len(articles)
+            articles["company_id"] = company_id
+            articles["name"] = name
+
+            # Standardize column names (gdeltdoc returns varying cases)
+            col_map = {c: c.lower() for c in articles.columns}
+            articles = articles.rename(columns=col_map)
+
+            if "tone" in articles.columns:
+                avg_tone = articles["tone"].mean()
+            if "domain" in articles.columns:
+                unique_sources = articles["domain"].nunique()
+            if "seendate" in articles.columns:
+                articles["seendate"] = pd.to_datetime(
+                    articles["seendate"], errors="coerce"
+                )
+                latest_article_date = articles["seendate"].max()
+
+            # Keep columns for output
+            keep_cols = ["company_id", "name", "url", "title", "seendate", "domain", "tone"]
+            available = [c for c in keep_cols if c in articles.columns]
+            all_articles.append(articles[available])
+    except Exception as e:
+        errors.append({"company_id": company_id, "name": name, "phase": "articles", "error": str(e)})
+
+    time.sleep(RATE_LIMIT_DELAY)
+
+    # --- Timeline volume search ---
+    try:
+        f_tl = Filters(
+            keyword=keyword,
+            start_date=START_DATE,
+            end_date=END_DATE,
+            country="US",
+            language="English",
+        )
+        timeline = gd.timeline_search("timelinevol", f_tl)
+
+        if timeline is not None and len(timeline) > 1:
+            # Timeline has datetime index/column and a volume column
+            tl_cols = [c for c in timeline.columns if c != "datetime"]
+            if tl_cols:
+                vol_col = tl_cols[0]
+                tl = timeline[["datetime", vol_col]].dropna()
+                if len(tl) > 1:
+                    # Convert datetime to numeric (days since start) for regression
+                    tl["datetime"] = pd.to_datetime(tl["datetime"], errors="coerce")
+                    tl = tl.dropna(subset=["datetime"])
+                    if len(tl) > 1:
+                        x = (tl["datetime"] - tl["datetime"].min()).dt.total_seconds() / 86400
+                        y = tl[vol_col].astype(float)
+                        # Linear regression slope via numpy
+                        x_arr = x.values
+                        y_arr = y.values
+                        n = len(x_arr)
+                        slope = (
+                            (n * np.sum(x_arr * y_arr) - np.sum(x_arr) * np.sum(y_arr))
+                            / (n * np.sum(x_arr**2) - np.sum(x_arr) ** 2)
+                        )
+                        mention_velocity = float(slope)
+    except Exception as e:
+        errors.append({"company_id": company_id, "name": name, "phase": "timeline", "error": str(e)})
+
+    time.sleep(RATE_LIMIT_DELAY)
+
+    summary_rows.append({
+        "company_id": company_id,
+        "name": name,
+        "article_count": article_count,
+        "avg_tone": avg_tone,
+        "unique_sources": unique_sources,
+        "latest_article_date": latest_article_date,
+        "mention_velocity": mention_velocity,
+    })
+
+    print(f"{article_count} articles")
+
+print(f"\nCollection done: {len(summary_rows)} companies processed, {len(errors)} errors")
+```
+
+
+
+## Build and Save Outputs
+
+Assemble article-level dataframe
+```{python}
+if all_articles:
+    articles_df = pd.concat(all_articles, ignore_index=True)
+else:
+    articles_df = pd.DataFrame(
+        columns=["company_id", "name", "url", "title", "seendate", "domain", "tone"]
+    )
+
+articles_path = DATA_DIR / "news_gdelt_articles.parquet"
+articles_df.to_parquet(articles_path, index=False)
+print(f"Saved {len(articles_df)} article rows to {articles_path}")
+articles_df.head(10)
+```
+
+Assemble summary dataframe (one row per company)
+```{python}
+summary_df = pd.DataFrame(summary_rows)
+summary_df["latest_article_date"] = pd.to_datetime(
+    summary_df["latest_article_date"], errors="coerce"
+)
+
+summary_path = DATA_DIR / "news_gdelt_summary.parquet"
+summary_df.to_parquet(summary_path, index=False)
+print(f"Saved {len(summary_df)} summary rows to {summary_path}")
+summary_df.head(10)
+```
+
+## Summary Statistics
+
+```{python}
+total_articles = summary_df["article_count"].sum()
+companies_with_mentions = (summary_df["article_count"] > 0).sum()
+companies_zero = (summary_df["article_count"] == 0).sum()
+
+print(f"Total articles collected: {total_articles}")
+print(f"Companies with >= 1 mention: {companies_with_mentions}")
+print(f"Companies with 0 mentions: {companies_zero}")
+
+if total_articles > 0:
+    print(f"\nArticle count distribution:")
+    print(summary_df["article_count"].describe().to_string())
+
+    print(f"\nTop 10 companies by article count:")
+    top10 = summary_df.nlargest(10, "article_count")[["name", "article_count", "avg_tone", "unique_sources", "mention_velocity"]]
+    print(top10.to_string(index=False))
+
+    non_null_tone = summary_df["avg_tone"].dropna()
+    if len(non_null_tone) > 0:
+        print(f"\nAverage tone distribution (n={len(non_null_tone)}):")
+        print(non_null_tone.describe().to_string())
+
+    non_null_vel = summary_df["mention_velocity"].dropna()
+    if len(non_null_vel) > 0:
+        print(f"\nMention velocity distribution (n={len(non_null_vel)}):")
+        print(non_null_vel.describe().to_string())
+
+if errors:
+    print(f"\n{len(errors)} errors encountered:")
+    for e in errors[:10]:
+        print(f"  [{e['phase']}] {e['name']}: {e['error']}")
+    if len(errors) > 10:
+        print(f"  ... and {len(errors) - 10} more")
+```
+
+## Unit Tests
+
+Precondition and postcondition tests
+```{python}
+# ---- Precondition tests ----
+assert "company_id" in spine.columns, "Spine missing company_id"
+assert "name" in spine.columns, "Spine missing name"
+assert len(spine) > 0, "Spine is empty"
+print("Precondition tests passed")
+
+# ---- Postcondition tests ----
+out_summary = pd.read_parquet(DATA_DIR / "news_gdelt_summary.parquet")
+out_articles = pd.read_parquet(DATA_DIR / "news_gdelt_articles.parquet")
+
+# Summary has expected columns
+expected_summary_cols = {
+    "company_id", "name", "article_count", "avg_tone",
+    "unique_sources", "latest_article_date", "mention_velocity",
+}
+assert expected_summary_cols.issubset(set(out_summary.columns)), (
+    f"Missing summary columns: {expected_summary_cols - set(out_summary.columns)}"
+)
+
+# Summary has exactly 871 rows (one per company)
+assert len(out_summary) == len(spine), (
+    f"Summary has {len(out_summary)} rows, expected {len(spine)}"
+)
+
+# No duplicate company_ids in summary
+dupes = out_summary["company_id"].duplicated().sum()
+assert dupes == 0, f"Found {dupes} duplicate company_ids in summary"
+
+# All summary company_ids exist in spine
+assert out_summary["company_id"].isin(spine["company_id"]).all(), (
+    "Found company_ids in summary not present in spine"
+)
+
+# article_count >= 0 for all rows
+assert (out_summary["article_count"] >= 0).all(), (
+    "Found negative article_count values"
+)
+
+# Articles company_ids are a subset of spine company_ids
+if len(out_articles) > 0:
+    assert out_articles["company_id"].isin(spine["company_id"]).all(), (
+        "Found company_ids in articles not present in spine"
+    )
+
+print("Postcondition tests passed")
+print(f"  Summary: {len(out_summary)} rows, {out_summary.columns.tolist()}")
+print(f"  Articles: {len(out_articles)} rows, {out_articles.columns.tolist()}")
+```
