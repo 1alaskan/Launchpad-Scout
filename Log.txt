@@ -1,0 +1,113 @@
+
+2/19/2026 
+
+Context
+
+I'm looking for a job, hopefully an interesting one. Okay, I'll apply. Cold applying went nowhere. Alright, I'll network to learn domain
+knowledge, and if people are nice they might refer me. Well, people are very nice! That's the good news. Unfortunately, corporate 
+referrals don't mean a whole lot in general. Furthermore, a lot of companies aren't hiring, wah wah wah, the job market is terrible, 
+cry about it, then keep working the problem.
+
+The problem is jobs aren't growing on trees and referrals don't mean much. The solution, find companies where referrals matter and that 
+are actually growing. Startups. Cool! I live in the bay, I work obsessivly on things that capture my interest, I have a buiness and
+tech background, I work well withouth mutch instruction or guidence, and I like doing all kinds of diffrent tasks, not just specilizing. 
+
+Okay, time to find some startups and reach out! Turns out startup people are pretty busy and get blown up by cold outreach. 
+Who knew? Shocking. So how do I find startups before they're already making noise?
+
+There are tools like Harmonic.ai, Seedtable, Fundz, and Crunchbase Pro, but all of those are expensive and built for investors and 
+sales teams. The signals they track are related, but not ideal for a job seeker.
+
+So where's the startup pipeline tracker built for someone like me? There's WellFound and other startup job boards, but those tend to 
+skew Series C and later, and the roles aren't exactly entry level friendly. As far as I can tell, a tool to find up and coming startups 
+that are receptive to outreach, doesn't exist.
+
+So I'm going to build it.
+
+---
+ Project Requirments 
+
+1. Data Audit (done)
+2. Cleaned Static data (done)
+3. Cleaned Dyanamic data (inprogress)
+4. Feature Egnineering 
+5. ML Model 
+    -Funding Classifyer
+        -predict probailities that companies will rel funding in the next 90 days 
+6. AWS pipline 
+    -Dynamic scoring system 
+7. Live Dashboard 
+
+
+ OLD Project Goals  (this workflow rushed toward implemetnetion wihtouth exploring data sorucse first to cut down on integrating data that was completlty null)
+
+1. Build an ETL pipeline
+     — ingest and normalize data from WellFound, NewsAPI, LinkedIn job postings, and GitHub into a unified SQL database
+2. Automate data collection 
+    — schedule daily scraper runs via APScheduler so the pipeline stays fresh without manual effort
+3. Engineer a momentum scoring model 
+    — design a weighted scoring engine (0–100) using feature engineering across funding recency, job posting velocity, news mentions, and engineering activity
+4. Surface actionable targets 
+    — build a Streamlit dashboard with product analytics views (filters by stage, domain, score) to generate a weekly ranked outreach list
+5. Track networking activity
+     — embed a lightweight CRM log to record contacts, outreach status, and notes per company
+6. Deliver weekly digests
+     — automate a summary email of the top 10 highest-momentum startups each week using Python automation
+7. Deploy to the cloud 
+    — host on Render or Railway so the API integrations and scrapers run continuously without a local machine
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+ 2/18/2026
+
+ -did step one, crunchbase API is blocked, so I exported the 1,000 comapnies it will let you do at a time and went with that 
+ -did step two, found job posting over time 
+ -tried step 3, but the data it pulled was blank because small startups dont have news articles writen about them, shocker
+ -stried step 4, tried to pull more chrunch base data with thier AI, whcih I knew from step 1 wouldent work, but I vide coded it 
+ and AI doestn have the forsigth to say "this is bad idea". Tut tut tut. AI cant really think like a person, it just does what its told. 
+
+ -------------------------------------
+ 2/21/2026
+
+-Working on Requirment One
+-tried step 5, the problem is it will need to add a parser to get the github links for each comapny,
+    which would take an hour or so1
+-This could have been done in step one by pulling it from cruncbase, same as step 4 (founders info)
+
+So?
+    -Clarfied project goals and scope, made promt, switch Claude CLT to planning mode...
+    -yea that plan is way to complicated (detialed plan.md), at least I tried the tool
+    -Made a new simpler list of chronolgical Project Requierments 
+        -Added a data audting step to make find out what data soureces show promise BEFORE implementing
+        -moved files for previoseu projects requiermens into new beta file, Step 1 and 2 can be repuprosed
+
+    -predict what type of comapny a given Vc company investes based on thier protoflio,
+    predcit which VC comapny? Domain? Based on each Vc predictor, rank cahnges of funding based on predicitors for diffeernt VC
+
+Data Join
+    -not needed, in step 4, features will be computed from each source seperatly 
+
+------------------------------------------
+2/22/2026
+
+-started step 3
+    -three dynamic data sources to try for now, JObSpy (done), SEC EDGAR (done), GDELT (pulled empty values, same as NewsAPI)
+    -SEC EDGAR only pulled data for 29 companies, but in a a proget liek this we expect most data to be null becaue of how new the companies are, so that okays
+    -turned of Claude CLI permission to accsess websites, this data is not confidental, just running on a local file
+
+Dyamic data sources to try next 
+    -Git Hub
+    -SimilarWeb (low hit, high vlaue)
+    -Tranco (low, hit high vlaue)
+
+    Git Hub 
+        -made a Git Token (works as apassword to Git hub account iwhtout actually sugin you password) for 90 days, dont sahre it becuase it sbsiacly a password
+        -Now waiting for git hub to parse information, not sure how long it will take 
+        -got 243 out of 871, not bad 
+            -need to build it out to get more infor like repsository stars and what not
+
+    Google_Trends 
+        -worked pretty well
+        -top ten results are prorably gerneric words that are the same as de fuzzed comapny names, flag  during feature enginnering 
+
+okay, I think I pretty mutch finished step 3. Prorbaly will have to look for more dyanmci data and maybe update static data spine when my pull quote getes rensued from Crunchbase next mounth. 
