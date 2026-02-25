@@ -1,0 +1,483 @@
+---
+title: "FE-01 -- Data Cleaning & Standardization"
+format: html
+---
+
+## Overview
+
+Clean and standardize the four raw data sources before feature engineering.
+All source files are read from `Data/` and cleaned versions are saved to `Data/cleaned/`.
+
+**Input:**
+
+- `Data/companies_spine.parquet` -- 871 companies, 44 columns
+- `Data/github_activity_summary.parquet` -- 871 rows (235 with actual GitHub data)
+- `Data/job_postings_raw.parquet` -- 436 job postings across 117 companies
+- `Data/google_trends.csv` -- ~80K rows of daily search interest for 869 companies
+- `Data/company_id_lookup.csv` -- 871 rows mapping company_id to name/domain/website
+
+**Output:**
+
+- `Data/cleaned/spine_cleaned.parquet`
+- `Data/cleaned/github_activity_cleaned.parquet`
+- `Data/cleaned/job_postings_cleaned.parquet`
+- `Data/cleaned/google_trends_cleaned.parquet`
+- `Data/cleaned/company_id_lookup.csv`
+
+Import pandas, numpy, and pathlib. Resolve the project root by walking up from the
+notebook's working directory until we find `Data/companies_spine.parquet`, then create
+the `Data/cleaned/` output directory.
+```{python}
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+PROJECT_NAME = "Startup Momentum Prediction Pipeline"
+MARKER = Path("Data") / "companies_spine.parquet"
+
+def _find_project_root():
+    """Find the project root by walking up, then checking for the project as a child."""
+    starts = [Path.cwd()]
+    try:
+        starts.append(Path(__vsc_ipynb_file__).parent)
+    except NameError:
+        pass
+    # Walk UP from each starting point
+    for start in starts:
+        p = start
+        for _ in range(5):
+            if (p / MARKER).exists():
+                return p
+            p = p.parent
+    # Walk DOWN: cwd may be the parent of the project folder
+    for start in starts:
+        candidate = start / PROJECT_NAME
+        if (candidate / MARKER).exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Cannot find {MARKER} (searched from: {[str(s) for s in starts]})"
+    )
+
+PROJECT_ROOT = _find_project_root()
+DATA_DIR = PROJECT_ROOT / "Data"
+
+OUT = DATA_DIR / "cleaned"
+OUT.mkdir(exist_ok=True)
+print(f"Project root: {PROJECT_ROOT}")
+print(f"Data dir:     {DATA_DIR}")
+print(f"Output dir:   {OUT}")
+```
+
+## Load Raw Data
+
+Load all five source files into DataFrames and store their original row counts.
+These counts are used later in the unit tests to verify that no rows were accidentally
+added or dropped during cleaning.
+```{python}
+spine = pd.read_parquet(DATA_DIR / "companies_spine.parquet", engine="pyarrow")
+github = pd.read_parquet(DATA_DIR / "github_activity_summary.parquet", engine="pyarrow")
+jobs = pd.read_parquet(DATA_DIR / "job_postings_raw.parquet", engine="pyarrow")
+trends = pd.read_csv(DATA_DIR / "google_trends.csv")
+lookup = pd.read_csv(DATA_DIR / "company_id_lookup.csv")
+
+print(f"Loaded spine:   {spine.shape}")
+print(f"Loaded github:  {github.shape}")
+print(f"Loaded jobs:    {jobs.shape}")
+print(f"Loaded trends:  {trends.shape}")
+print(f"Loaded lookup:  {lookup.shape}")
+
+# Store original row counts for assertions
+SPINE_ROWS = len(spine)
+JOBS_ROWS = len(jobs)
+TRENDS_ROWS = len(trends)
+GITHUB_ROWS = len(github)
+```
+
+## 1. Drop Dead Columns from Spine
+
+Six columns in the spine are either 100% null (`actively_hiring`, `num_funding_rounds`,
+`founder_names`, `github_url`, `twitter_url`) or too sparse to be useful (`phone_number`
+at 578/871 null). Drop all six so they don't pollute downstream feature engineering.
+```{python}
+dead_cols = [
+    "actively_hiring",
+    "num_funding_rounds",
+    "founder_names",
+    "github_url",
+    "twitter_url",
+    "phone_number",
+]
+spine = spine.drop(columns=dead_cols)
+print(f"Dropped {len(dead_cols)} dead columns: {dead_cols}")
+print(f"Spine now has {spine.shape[1]} columns")
+```
+
+## 2. Encode num_employees as Ordinal Integer
+
+The `num_employees` column contains string ranges like "1-10", "11-50", etc. Map each
+range to an ordinal integer (1 through 6) in a new `emp_bucket` column so models can
+treat company size as a numeric feature. The 6 companies with null `num_employees` get
+NaN in `emp_bucket`. The original string column is kept for reference.
+```{python}
+emp_map = {
+    "1-10": 1,
+    "11-50": 2,
+    "51-100": 3,
+    "101-250": 4,
+    "251-500": 5,
+    "1001-5000": 6,
+}
+spine["emp_bucket"] = spine["num_employees"].map(emp_map)
+
+print("emp_bucket distribution:")
+print(spine["emp_bucket"].value_counts().sort_index().to_string())
+print(f"NaN count: {spine['emp_bucket'].isna().sum()}")
+```
+
+## 3. Simplify last_funding_type into Ordinal funding_stage
+
+The `last_funding_type` column has 18 distinct values representing granular funding
+round labels. Collapse them into a 5-level ordinal scale:
+
+- **0** -- Pre-seed tier (Pre-Seed, Angel, Grant, Non-equity Assistance)
+- **1** -- Seed tier (Seed, Convertible Note, Venture Unknown, Crowdfunding)
+- **2** -- Series A tier (Series A, Corporate Round)
+- **3** -- Series B
+- **4** -- Post-IPO (Post-IPO Equity, Post-IPO Debt)
+- **NaN** -- Ambiguous types (Debt Financing, Undisclosed, Private Equity, ICO)
+
+The original `last_funding_type` column is kept. Any funding types not in either the
+mapped or NaN sets trigger a warning so we catch data drift.
+```{python}
+funding_map = {
+    "Pre-Seed": 0,
+    "Angel": 0,
+    "Grant": 0,
+    "Non-equity Assistance": 0,
+    "Convertible Note": 1,
+    "Seed": 1,
+    "Venture - Unknown": 1,
+    "Venture (Unknown Series)": 1,
+    "Equity Crowdfunding": 1,
+    "Product Crowdfunding": 1,
+    "Series A": 2,
+    "Corporate Round": 2,
+    "Series B": 3,
+    "Post-IPO Equity": 4,
+    "Post-IPO Debt": 4,
+}
+# Types that intentionally map to NaN
+nan_types = {
+    "Debt Financing",
+    "Undisclosed",
+    "Private Equity",
+    "Initial Coin Offering",
+}
+
+spine["funding_stage"] = spine["last_funding_type"].map(funding_map)
+
+unmapped = spine.loc[
+    spine["funding_stage"].isna() & spine["last_funding_type"].notna(),
+    "last_funding_type",
+].unique()
+unexpected = set(unmapped) - nan_types
+if unexpected:
+    print(f"WARNING: unexpected unmapped funding types: {unexpected}")
+
+print("funding_stage distribution:")
+print(spine["funding_stage"].value_counts().sort_index().to_string())
+print(f"NaN count: {spine['funding_stage'].isna().sum()}")
+```
+
+## 4. Handle Ambiguous Google Trends Companies
+
+19 companies have `is_ambiguous_name == True` in the trends data, meaning their names
+are common English words (e.g., "Edge", "Pure", "Sound") whose Google Trends search
+interest is polluted by unrelated queries. Set `search_interest` to NaN for these rows
+so they don't inject noise into trend-based features. The rows themselves are kept so
+every company remains present for downstream joins.
+```{python}
+ambiguous_mask = trends["is_ambiguous_name"] == True
+ambiguous_companies = trends.loc[ambiguous_mask, "company_name"].unique()
+print(f"Flagged {len(ambiguous_companies)} ambiguous companies:")
+for c in sorted(ambiguous_companies):
+    print(f"  - {c}")
+
+trends.loc[ambiguous_mask, "search_interest"] = np.nan
+print(f"\nSet {ambiguous_mask.sum()} rows of search_interest to NaN")
+```
+
+## 5. Fill num_articles Nulls
+
+148 companies have null `num_articles`. Since the data was collected via NewsAPI, a null
+here means no articles were found -- not that the value is unknown. Fill with 0 so the
+model treats these companies as having zero press coverage (a meaningful signal).
+```{python}
+na_articles = spine["num_articles"].isna().sum()
+spine["num_articles"] = spine["num_articles"].fillna(0).astype(int)
+print(f"Filled {na_articles} null num_articles with 0")
+```
+
+## 6. Flag Missing last_funding_amount_usd
+
+112 companies have null `last_funding_amount_usd`, which means the funding amount was
+undisclosed -- not that it was zero. Imputing would introduce false signal, so we leave
+the NaN in place and add a boolean `has_last_funding_amount` column. This lets the model
+learn separate behavior for "undisclosed" vs. actual dollar amounts.
+```{python}
+na_funding_amt = spine["last_funding_amount_usd"].isna().sum()
+spine["has_last_funding_amount"] = spine["last_funding_amount_usd"].notna()
+print(f"last_funding_amount_usd: {na_funding_amt} nulls left as NaN")
+print(f"has_last_funding_amount -- True: {spine['has_last_funding_amount'].sum()}, False: {(~spine['has_last_funding_amount']).sum()}")
+```
+
+## 7. Flag Missing num_investors
+
+76 companies have null `num_investors`. Same reasoning as funding amount: null means
+undisclosed, not zero. Leave as NaN and add `has_investor_data` boolean flag so the
+model can distinguish the two cases.
+```{python}
+na_investors = spine["num_investors"].isna().sum()
+spine["has_investor_data"] = spine["num_investors"].notna()
+print(f"num_investors: {na_investors} nulls left as NaN")
+print(f"has_investor_data -- True: {spine['has_investor_data'].sum()}, False: {(~spine['has_investor_data']).sum()}")
+```
+
+## 8. Standardize Industries into Binary Flags
+
+The `industries` column contains 443 unique values as comma-separated tags (e.g.,
+"Artificial Intelligence (AI), Software, SaaS"). One-hot encoding all 443 would be too
+sparse, so we create binary columns for the 12 most common industries plus an
+`ind_other` catch-all flag (1 if the company has any tag outside the top 12). Companies
+with null `industries` get 0 across all flags. The original `industries` column is kept.
+```{python}
+top_industries = {
+    "ind_ai": "Artificial Intelligence (AI)",
+    "ind_software": "Software",
+    "ind_it": "Information Technology",
+    "ind_saas": "SaaS",
+    "ind_healthcare": "Health Care",
+    "ind_fintech": "FinTech",
+    "ind_financial": "Financial Services",
+    "ind_ml": "Machine Learning",
+    "ind_manufacturing": "Manufacturing",
+    "ind_biotech": "Biotechnology",
+    "ind_genai": "Generative AI",
+    "ind_devtools": "Developer Tools",
+}
+
+top_labels = set(top_industries.values())
+
+# Parse comma-separated industries into a list per row
+ind_series = spine["industries"].fillna("").str.split(r",\s*")
+
+for col_name, label in top_industries.items():
+    spine[col_name] = ind_series.apply(lambda tags: int(label in tags))
+
+# ind_other: 1 if the company has any tag NOT in top 12
+spine["ind_other"] = ind_series.apply(
+    lambda tags: int(any(t for t in tags if t and t not in top_labels))
+)
+
+# Zero out industry flags for companies with no industries data
+no_ind = spine["industries"].isna()
+for col_name in list(top_industries.keys()) + ["ind_other"]:
+    spine.loc[no_ind, col_name] = 0
+
+print("Industry binary flags created:")
+for col_name, label in top_industries.items():
+    print(f"  {col_name} ({label}): {spine[col_name].sum()}")
+print(f"  ind_other: {spine['ind_other'].sum()}")
+```
+
+## 9. Link Job Postings to company_id
+
+Job postings are keyed on `company_searched` (the company name used in the LinkedIn
+search), not `company_id`. Left-join against the lookup table on `name` to add
+`company_id`. The lookup has 2 duplicate name pairs (Metal, Strada -- different
+companies that share a name), so we deduplicate by keeping the first occurrence to
+prevent row multiplication during the join.
+```{python}
+# Deduplicate lookup by name (2 pairs share names: Metal, Strada) -- keep first
+lookup_dedup = lookup.drop_duplicates(subset="name", keep="first")
+
+jobs = jobs.merge(
+    lookup_dedup[["company_id", "name"]],
+    left_on="company_searched",
+    right_on="name",
+    how="left",
+)
+jobs = jobs.drop(columns=["name"])
+
+matched = jobs["company_id"].notna().sum()
+unmatched = jobs["company_id"].isna().sum()
+print(f"Job postings linked to company_id:")
+print(f"  Matched:   {matched}/{len(jobs)}")
+print(f"  Unmatched: {unmatched}/{len(jobs)}")
+```
+
+## 10. Link Google Trends to company_id
+
+Google Trends data is keyed on `company_name`. Left-join against the same deduplicated
+lookup table to add `company_id`, enabling downstream joins with the spine and other
+company_id-keyed datasets.
+```{python}
+trends = trends.merge(
+    lookup_dedup[["company_id", "name"]],
+    left_on="company_name",
+    right_on="name",
+    how="left",
+)
+trends = trends.drop(columns=["name"])
+
+matched_trends = trends["company_id"].notna().sum()
+unmatched_trends = trends["company_id"].isna().sum()
+print(f"Google Trends linked to company_id:")
+print(f"  Matched:   {matched_trends}/{len(trends)}")
+print(f"  Unmatched: {unmatched_trends}/{len(trends)}")
+```
+
+## 11. Parse Date in Google Trends
+
+The `date` column was read from CSV as strings (e.g., "2025-11-23"). Convert to
+datetime so downstream feature engineering can do time-based operations like rolling
+windows and date arithmetic.
+```{python}
+trends["date"] = pd.to_datetime(trends["date"])
+print(f"Converted trends date column to {trends['date'].dtype}")
+```
+
+## Save Cleaned Files
+
+Write all four cleaned DataFrames to parquet (pyarrow engine) and copy the lookup CSV
+into `Data/cleaned/`. GitHub activity required no changes beyond confirming it's clean,
+so it's saved as a passthrough.
+```{python}
+spine.to_parquet(OUT / "spine_cleaned.parquet", engine="pyarrow", index=False)
+github.to_parquet(OUT / "github_activity_cleaned.parquet", engine="pyarrow", index=False)
+jobs.to_parquet(OUT / "job_postings_cleaned.parquet", engine="pyarrow", index=False)
+trends.to_parquet(OUT / "google_trends_cleaned.parquet", engine="pyarrow", index=False)
+lookup.to_csv(OUT / "company_id_lookup.csv", index=False)
+
+print("Saved cleaned files to Data/cleaned/:")
+print(f"  spine_cleaned.parquet          ({len(spine)} rows)")
+print(f"  github_activity_cleaned.parquet ({len(github)} rows)")
+print(f"  job_postings_cleaned.parquet   ({len(jobs)} rows)")
+print(f"  google_trends_cleaned.parquet  ({len(trends)} rows)")
+print(f"  company_id_lookup.csv          ({len(lookup)} rows)")
+```
+
+## Unit Tests
+
+### Preconditions
+
+Verify that cleaning did not alter row counts or introduce duplicate keys. Each
+DataFrame should have exactly the same number of rows it started with (871 spine,
+871 github, 436 jobs, 80817 trends). The spine's `company_id` must remain unique
+since it's the primary key for all downstream joins.
+```{python}
+assert len(spine) == SPINE_ROWS, f"Spine row count changed: {len(spine)} != {SPINE_ROWS}"
+assert len(jobs) == JOBS_ROWS, f"Jobs row count changed: {len(jobs)} != {JOBS_ROWS}"
+assert len(trends) == TRENDS_ROWS, f"Trends row count changed: {len(trends)} != {TRENDS_ROWS}"
+assert len(github) == GITHUB_ROWS, f"GitHub row count changed: {len(github)} != {GITHUB_ROWS}"
+assert spine["company_id"].is_unique, "Duplicate company_id in spine!"
+
+print(f"OK: spine rows = {SPINE_ROWS}")
+print(f"OK: jobs rows = {JOBS_ROWS}")
+print(f"OK: trends rows = {TRENDS_ROWS}")
+print(f"OK: github rows = {GITHUB_ROWS}")
+print("OK: no duplicate company_id in spine")
+print("\nAll precondition checks passed.")
+```
+
+### Postconditions
+
+Verify that every cleaning transformation produced the expected results:
+
+- The 6 dead columns are gone from the spine
+- All new columns exist (`emp_bucket`, `funding_stage`, boolean flags, 13 industry flags)
+- `company_id` was successfully joined onto jobs and trends with no unmatched rows
+- The trends `date` column is datetime, not string
+- Ambiguous company search interest was set to NaN
+- Ordinal encodings are within expected ranges (emp_bucket 1-6, funding_stage 0-4)
+- `num_articles` has no negative values after the fill
+```{python}
+# Dead columns removed
+for col in dead_cols:
+    assert col not in spine.columns, f"{col} still in spine!"
+print("OK: dead columns removed")
+
+# New columns exist
+for col in ["emp_bucket", "funding_stage", "has_last_funding_amount", "has_investor_data"]:
+    assert col in spine.columns, f"{col} missing from spine"
+for ind_col in list(top_industries.keys()) + ["ind_other"]:
+    assert ind_col in spine.columns, f"{ind_col} missing from spine"
+print("OK: all new columns present in spine")
+
+# Joins added company_id with full coverage
+assert "company_id" in jobs.columns, "company_id missing from jobs"
+assert "company_id" in trends.columns, "company_id missing from trends"
+assert jobs["company_id"].notna().all(), "Some job postings missing company_id"
+assert trends["company_id"].notna().all(), "Some trends rows missing company_id"
+print("OK: company_id joined onto jobs and trends (100% match)")
+
+# Date parsed correctly
+assert str(trends["date"].dtype).startswith("datetime64"), \
+    f"Trends date not datetime: {trends['date'].dtype}"
+print("OK: trends date is datetime")
+
+# Ambiguous trends nulled
+assert trends.loc[trends["is_ambiguous_name"] == True, "search_interest"].isna().all(), \
+    "Ambiguous company search_interest not set to NaN"
+print("OK: ambiguous company search_interest set to NaN")
+
+# Value ranges
+assert spine["emp_bucket"].dropna().between(1, 6).all(), "emp_bucket out of range"
+assert spine["funding_stage"].dropna().between(0, 4).all(), "funding_stage out of range"
+assert (spine["num_articles"] >= 0).all(), "Negative num_articles"
+print("OK: emp_bucket in [1,6], funding_stage in [0,4], num_articles >= 0")
+
+print("\nAll postcondition checks passed.")
+```
+
+### Validation Summary
+
+Print a summary dashboard of the cleaned data: row counts, spine null rates,
+`funding_stage` and `emp_bucket` distributions, and confirmation that all four
+cleaned files share a joinable `company_id` key.
+```{python}
+print("=" * 70)
+print("VALIDATION SUMMARY")
+print("=" * 70)
+
+print("\n-- Row counts --")
+print(f"  spine:   {len(spine):>6}  (expected {SPINE_ROWS})")
+print(f"  github:  {len(github):>6}  (expected {GITHUB_ROWS})")
+print(f"  jobs:    {len(jobs):>6}  (expected {JOBS_ROWS})")
+print(f"  trends:  {len(trends):>6}  (expected {TRENDS_ROWS})")
+
+print("\n-- Spine null rates --")
+null_rates = spine.isnull().mean().sort_values(ascending=False)
+for col, rate in null_rates.items():
+    if rate > 0:
+        print(f"  {col:<35} {rate:>6.1%}")
+print(f"  ... {(null_rates == 0).sum()} columns with 0% nulls")
+
+print("\n-- funding_stage distribution --")
+print(spine["funding_stage"].value_counts().sort_index().to_string())
+print(f"  NaN: {spine['funding_stage'].isna().sum()}")
+
+print("\n-- emp_bucket distribution --")
+print(spine["emp_bucket"].value_counts().sort_index().to_string())
+print(f"  NaN: {spine['emp_bucket'].isna().sum()}")
+
+print("\n-- company_id joinability --")
+spine_ids = set(spine["company_id"])
+github_ids = set(github["company_id"])
+jobs_ids = set(jobs.loc[jobs["company_id"].notna(), "company_id"])
+trends_ids = set(trends.loc[trends["company_id"].notna(), "company_id"])
+print(f"  spine company_ids:  {len(spine_ids)}")
+print(f"  github & spine:     {len(github_ids & spine_ids)}/{len(github_ids)}")
+print(f"  jobs & spine:       {len(jobs_ids & spine_ids)}/{len(jobs_ids)}")
+print(f"  trends & spine:     {len(trends_ids & spine_ids)}/{len(trends_ids)}")
+```
