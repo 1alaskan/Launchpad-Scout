@@ -1,0 +1,11 @@
+# Streamlit secrets (contains AWS credentials)
+Dashboard/.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
