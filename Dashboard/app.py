@@ -577,10 +577,15 @@ def main():
     st.markdown(
         '<div class="weekly-banner">'
         "This dashboard updates automatically every week. "
-        "An AWS pipeline (Step Functions + EMR Serverless) re-scores all companies "
+        "An AWS pipeline (Step Functions + EMR Serverless) rescores all companies "
         "each Monday and writes fresh results to S3."
         "</div>",
         unsafe_allow_html=True,
+    )
+    st.markdown(
+        "Scoring 800+ SF Bay Area startups by growth momentum using funding, hiring, "
+        "and news signals. Data sourced from Crunchbase — "
+        "[GitHub](https://github.com/1alaskan/Launchpad-Scout) to run it on your own company list."
     )
     st.caption("Ranked by hiring friendliness score")
 
