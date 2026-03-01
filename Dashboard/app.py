@@ -67,6 +67,15 @@ button[data-baseweb="tab"][aria-selected="true"] {
     border-bottom-color: var(--blue-500) !important;
 }
 
+/* Top-right toolbar icons (GitHub, share, etc.) */
+ul[data-testid="stToolbar"] {
+    gap: 0.75rem !important;
+}
+ul[data-testid="stToolbar"] button,
+ul[data-testid="stToolbar"] a {
+    transform: scale(1.4);
+}
+
 /* Weekly banner */
 .weekly-banner {
     background: linear-gradient(90deg, var(--blue-100), var(--blue-50));
@@ -583,9 +592,10 @@ def main():
         unsafe_allow_html=True,
     )
     st.markdown(
-        "Scoring 800+ SF Bay Area startups by growth momentum using funding, hiring, "
-        "and news signals. Data sourced from Crunchbase — "
-        "[GitHub](https://github.com/1alaskan/Launchpad-Scout) to run it on your own company list."
+        "Scoring 871 startups by growth momentum using funding, hiring, "
+        "and news signals. Check out the "
+        "[GitHub repo](https://github.com/1alaskan/Launchpad-Scout) "
+        "to run it on your own list of companies!"
     )
     st.caption("Ranked by hiring friendliness score")
 
