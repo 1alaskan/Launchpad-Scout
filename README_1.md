@@ -1,4 +1,6 @@
 
+## Startup Growth Radar
+
 What?
 
 Building a personal, automated pipeline that scores and ranks startups by hiring momentum and growth signals.

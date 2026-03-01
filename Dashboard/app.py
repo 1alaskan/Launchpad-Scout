@@ -1,5 +1,5 @@
 """
-Startup Momentum Dashboard — Streamlit application.
+Startup Growth Radar — Streamlit application.
 
 Reads scored data from S3 (refreshed weekly by the AWS pipeline)
 and presents a ranked, filterable view of ~846 startups.
@@ -16,7 +16,7 @@ import streamlit as st
 # ── Page config (must be first Streamlit command) ────────────────────────────
 
 st.set_page_config(
-    page_title="Startup Momentum Dashboard",
+    page_title="Startup Growth Radar",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -582,7 +582,7 @@ def render_overview_tab(data: dict, master_df: pd.DataFrame):
 
 
 def main():
-    st.title("Startup Momentum Dashboard")
+    st.title("Startup Growth Radar")
     st.markdown(
         '<div class="weekly-banner">'
         "This dashboard updates automatically every week. "
@@ -594,7 +594,7 @@ def main():
     st.markdown(
         "Scoring 871 startups by growth momentum using funding, hiring, "
         "and news signals. Check out the "
-        "[GitHub repo](https://github.com/1alaskan/Launchpad-Scout) "
+        "[Startup Growth Radar GitHub repo](https://github.com/1alaskan/Launchpad-Scout) "
         "to run it on your own list of companies!"
     )
     st.caption("Ranked by hiring friendliness score")
