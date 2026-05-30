@@ -6,6 +6,7 @@ and presents a ranked, filterable view of ~846 startups.
 """
 
 import io
+import json
 from datetime import datetime, timezone
 
 import boto3
@@ -76,6 +77,32 @@ ul[data-testid="stToolbar"] button,
 ul[data-testid="stToolbar"] a {
     transform: scale(1.4);
 }
+
+/* Memo cards */
+.memo-card {
+    background: #ffffff;
+    border: 1px solid var(--blue-200);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+}
+.memo-headline {
+    font-size: 1rem;
+    font-weight: 600;
+    color: #111827;
+    margin-bottom: 6px;
+}
+.memo-hook {
+    font-size: 0.85rem;
+    color: var(--blue-600);
+    font-style: italic;
+    margin-top: 10px;
+    border-top: 1px solid var(--blue-100);
+    padding-top: 8px;
+}
+.confidence-high   { background:#dcfce7; color:#166534; border-radius:4px; padding:2px 8px; font-size:0.75rem; font-weight:600; }
+.confidence-medium { background:#fef9c3; color:#854d0e; border-radius:4px; padding:2px 8px; font-size:0.75rem; font-weight:600; }
+.confidence-low    { background:#fee2e2; color:#991b1b; border-radius:4px; padding:2px 8px; font-size:0.75rem; font-weight:600; }
 
 /* Weekly banner */
 .weekly-banner {
@@ -234,6 +261,35 @@ def load_evaluation_artifacts() -> dict:
             # File not uploaded yet — tab will render an empty-state message.
             out[name] = None
     return out
+
+
+# ── Memo loading ─────────────────────────────────────────────────────────────
+
+
+@st.cache_data(ttl=3600)
+def list_memo_dates() -> list[str]:
+    """Return available memo run dates (YYYY-MM-DD) sorted newest-first."""
+    s3 = _get_s3_client()
+    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix="memos/", Delimiter="/")
+    dates = [
+        p["Prefix"].rstrip("/").split("/")[-1]
+        for p in resp.get("CommonPrefixes", [])
+    ]
+    return sorted(dates, reverse=True)
+
+
+@st.cache_data(ttl=3600)
+def load_memos(run_date: str) -> list[dict]:
+    """Load all memo JSON files for a given run date from S3."""
+    s3 = _get_s3_client()
+    prefix = f"memos/{run_date}/"
+    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+    memos = []
+    for obj in resp.get("Contents", []):
+        if obj["Key"].endswith(".json"):
+            body = s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
+            memos.append(json.loads(body))
+    return memos
 
 
 # ── Data preparation ─────────────────────────────────────────────────────────
@@ -801,6 +857,82 @@ def render_overview_tab(data: dict, master_df: pd.DataFrame):
         st.plotly_chart(fig, use_container_width=True)
 
 
+def render_memo_tab(master_df: pd.DataFrame):
+    """Render the Weekly Memo tab with AI-generated company memos from S3."""
+    st.markdown("### Weekly AI Memos")
+    st.caption(
+        "Claude-generated investment memos for the top 20 companies by hiring score. "
+        "Refreshed every Monday by the AWS pipeline."
+    )
+
+    try:
+        available_dates = list_memo_dates()
+    except Exception as e:
+        st.error(f"Could not list memo dates from S3: {e}")
+        return
+
+    if not available_dates:
+        st.info("No memos have been generated yet. The pipeline runs every Monday.")
+        return
+
+    selected_date = st.selectbox(
+        "Week of",
+        options=available_dates,
+        format_func=lambda d: f"Week of {d}",
+    )
+
+    try:
+        memos = load_memos(selected_date)
+    except Exception as e:
+        st.error(f"Could not load memos for {selected_date}: {e}")
+        return
+
+    if not memos:
+        st.info(f"No memos found for {selected_date}.")
+        return
+
+    id_to_name = dict(zip(master_df["company_id"].astype(str), master_df["name"]))
+
+    conf_filter = st.multiselect(
+        "Filter by confidence",
+        options=["high", "medium", "low"],
+        default=["high", "medium", "low"],
+    )
+    memos = [m for m in memos if m.get("confidence") in conf_filter]
+
+    st.markdown(f"**{len(memos)} memos**")
+    st.markdown("---")
+
+    for memo in memos:
+        company_id = str(memo.get("company_id", ""))
+        company_name = id_to_name.get(company_id, company_id)
+        confidence = memo.get("confidence", "low")
+        conf_html = f'<span class="confidence-{confidence}">{confidence.upper()}</span>'
+
+        st.markdown(
+            f'<div class="memo-card">'
+            f'<div class="memo-headline">{company_name} &nbsp; {conf_html}</div>'
+            f'<p style="color:#374151;margin:4px 0 10px 0">{memo.get("headline","")}</p>',
+            unsafe_allow_html=True,
+        )
+
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown("**Momentum Drivers**")
+            for driver in memo.get("momentum_drivers", []):
+                st.markdown(f"- {driver}")
+        with col_r:
+            st.markdown("**Risk Flags**")
+            for flag in memo.get("risk_flags", []):
+                st.markdown(f"- {flag}")
+
+        st.markdown(
+            f'<div class="memo-hook">💬 Outreach hook: {memo.get("outreach_hook","")}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -884,12 +1016,14 @@ def main():
     (
         tab_rankings,
         tab_overview,
+        tab_memos,
         tab_backtest,
         tab_hits,
         tab_calibration,
     ) = st.tabs([
         "Company Rankings",
         "Data Overview",
+        "Weekly Memos",
         "Backtest Results",
         "Hits Feed",
         "Calibration",
@@ -919,6 +1053,9 @@ def main():
 
     with tab_overview:
         render_overview_tab(data, master_df)
+
+    with tab_memos:
+        render_memo_tab(master_df)
 
     with tab_backtest:
         render_backtest_tab(eval_data)
